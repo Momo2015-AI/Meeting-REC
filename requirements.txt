@@ -1,0 +1,6 @@
+# Python 依赖（本机已安装：numpy 2.5.2 / cffi 2.1.1 / soundcard 0.4.6）
+numpy>=2.0
+cffi>=2.0
+soundcard>=0.4.6
+# 注意：识别引擎不使用 vosk Python 包，而是 ctypes 直绑 models/lib/libvosk.dll，
+# 以规避 vosk 包在 Python 3.14 上缺失 srt/requests 等依赖导致的导入失败。

@@ -1,0 +1,342 @@
+"""跨服务商后端回退测试。
+
+覆盖场景：
+  1. 主后端 /models 探测成功 → active_backend = primary
+  2. 主后端 404（不实现 /models）→ 自动改用 chat 探测，仍判为就绪
+  3. 主后端整体不可用 → 自动切到备用后端（豆包），active_backend = doubao
+  4. 翻译时主后端 500 → 自动降级到备用后端并成功返回译文
+  5. 翻译时主后端 403 → 降级到同后端的下一档模型
+  6. 全部后端都失败 → 返回空串，不抛异常
+  7. 总结时主后端失败 → 走备用后端出总结，summary_used_backend 正确
+  8. 配置层：alt_backends 能从 TOML 解析出 base_url / 密钥文件
+"""
+from __future__ import annotations
+
+import json
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from src.config import load_config  # noqa: E402
+from src.translate import Backend, Translator  # noqa: E402
+
+PASS, FAIL = "PASS", "FAIL"
+results: list[tuple[str, str, str]] = []
+
+
+def check(name: str, ok: bool, detail: str = "") -> None:
+    results.append((PASS if ok else FAIL, name, detail))
+    print(f"  [{'✓' if ok else '✗'}] {name}" + (f"  ({detail})" if detail else ""))
+
+
+class _Handler(BaseHTTPRequestHandler):
+    """按路径返回预设响应的假后端。
+
+    注意：routes 必须挂在"每个服务器各自的 Handler 子类"上。
+    若挂在基类上（类属性），多个服务器会互相覆盖路由，导致用例串味。
+    """
+    routes: dict[str, tuple[int, dict]] = {}
+
+    def log_message(self, *a):  # noqa: ANN002, ANN003
+        pass
+
+    def _read_body(self) -> dict:
+        """读取请求体（必须读，否则连接被重置，客户端报 IncompleteRead）。"""
+        try:
+            n = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            n = 0
+        if n <= 0:
+            return {}
+        try:
+            return json.loads(self.rfile.read(n).decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _send(self, code: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):  # noqa: N802
+        code, payload = self.routes.get("GET " + self.path, (404, {"error": "nope"}))
+        self._send(code, payload)
+
+    def do_POST(self):  # noqa: N802
+        self._read_body()
+        code, payload = self.routes.get("POST " + self.path, (404, {"error": "nope"}))
+        self._send(code, payload)
+
+
+def make_server(routes: dict[str, tuple[int, dict]]) -> tuple[HTTPServer, str]:
+    """启动一个独立路由表的假后端。"""
+    handler = type("_ScopedHandler", (_Handler,), {"routes": dict(routes)})
+    srv = HTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_address[1]}/v1"
+
+
+def main() -> int:
+    print("=== 跨服务商后端回退测试 ===\n")
+
+    # 场景 1：主后端正常
+    srv, url = make_server({
+        "GET /v1/models": (200, {"data": [{"id": "m-a"}]}),
+        "POST /v1/chat/completions": (200, {"choices": [{"message": {"content": "你好"}}]}),
+    })
+    tr = Translator(base_url=url, api_key="k", model="m-a")
+    ok, msg = tr.preflight()
+    check("场景1 主后端探测成功", ok and tr.active_backend == "primary", msg)
+
+    # 场景 2：主后端不实现 /models（404）→ 改用 chat 探测
+    srv2, url2 = make_server({
+        "GET /v1/models": (404, {"error": "not found"}),
+        "POST /v1/chat/completions": (200, {"choices": [{"message": {"content": "ok"}}]}),
+    })
+    tr2 = Translator(base_url=url2, api_key="k", model="m-a")
+    ok2, msg2 = tr2.preflight()
+    check("场景2 /models 404 时改用 chat 探测", ok2, msg2)
+
+    # 场景 3：主后端挂掉 → 切到豆包备用后端
+    srv3, url3 = make_server({
+        "GET /v1/models": (200, {"data": [{"id": "m-doubao"}]}),
+        "POST /v1/chat/completions": (200, {"choices": [{"message": {"content": "豆包译文"}}]}),
+    })
+    tr3 = Translator(
+        base_url="http://127.0.0.1:1/v1", api_key="k", model="m-a",
+        alt_backends=[Backend(name="doubao", base_url=url3, api_key="k2", model="m-doubao")],
+    )
+    ok3, msg3 = tr3.preflight()
+    check("场景3 主后端不可用时切到备用后端",
+          ok3 and tr3.active_backend == "doubao", msg3)
+
+    # 场景 4：翻译时主后端不可用 → 降级到备用后端成功
+    #   （主后端用"连接被拒"的地址，确保翻译请求确实失败）
+    tr4 = Translator(
+        base_url="http://127.0.0.1:1/v1", api_key="k", model="m-a",
+        alt_backends=[Backend(name="doubao", base_url=url3, api_key="k2", model="m-doubao")],
+    )
+    tr4.enabled = True
+    out4 = tr4.translate("hello", "en")
+    check("场景4 翻译自动降级到备用后端", out4 == "豆包译文", f"译文={out4!r}")
+
+    # 场景 5：主后端 403 → 同后端下一档模型
+    srv5, url5 = make_server({
+        "POST /v1/chat/completions": (403, {"error": {"message": "额度不足"}}),
+    })
+    tr5 = Translator(base_url=url5, api_key="k", model="m-a",
+                     translate_models=["m-a", "m-b"])
+    tr5.enabled = True
+    out5 = tr5.translate("hello", "en")
+    check("场景5 主后端失败时返回空串（无备用后端）", out5 == "", f"译文={out5!r}")
+
+    # 场景 6：主后端 403，同后端第二档模型成功
+    state = {"n": 0}
+
+    class _H2(_Handler):
+        def do_POST(self):  # noqa: N802
+            body = self._read_body()
+            model = body.get("model", "")
+            if model == "m-a":
+                self._send(403, {"error": {"message": "额度不足"}})
+            else:
+                self._send(200, {"choices": [{"message": {"content": "降级成功"}}]})
+
+    srv6 = HTTPServer(("127.0.0.1", 0), _H2)
+    threading.Thread(target=srv6.serve_forever, daemon=True).start()
+    url6 = f"http://127.0.0.1:{srv6.server_address[1]}/v1"
+    tr6 = Translator(base_url=url6, api_key="k", model="m-a",
+                     translate_models=["m-a", "m-b"])
+    tr6.enabled = True
+    out6 = tr6.translate("hello", "en")
+    check("场景6 同后端内降级到下一档模型", out6 == "降级成功", f"译文={out6!r}")
+
+    # 场景 7：总结时主后端失败 → 走备用后端
+    tr7 = Translator(
+        base_url=url5, api_key="k", model="m-a",
+        summary_models=["m-a"],
+        alt_backends=[Backend(name="doubao", base_url=url3, api_key="k2", model="m-doubao")],
+    )
+    tr7.enabled = True
+    md7 = tr7.summarize("会议转写内容", "总结提示词")
+    check("场景7 总结走备用后端",
+          md7 == "豆包译文" and tr7.summary_used_backend == "doubao",
+          f"used={getattr(tr7, 'summary_used_backend', '?')}")
+
+    # 场景 8：配置层 alt_backends 解析
+    cfg = load_config(ROOT / "config.toml")
+    alts = cfg.translate.alt_backends
+    ok8 = bool(alts) and alts[0].base_url.startswith("https://ark.")
+    check("场景8 配置解析出豆包备用后端", ok8,
+          f"name={alts[0].name if alts else '?'} url={alts[0].base_url if alts else '?'}")
+
+    # 场景 9：熔断——主后端连续失败后被跳过，不再重复调用
+    calls = {"primary": 0, "alt": 0}
+
+    class _H3(_Handler):
+        def do_POST(self):  # noqa: N802
+            body = self._read_body()
+            model = body.get("model", "")
+            if model == "m-a":
+                calls["primary"] += 1
+                self._send(403, {"error": {"message": "额度不足"}})
+            else:
+                calls["alt"] += 1
+                self._send(200, {"choices": [{"message": {"content": "豆包译文"}}]})
+
+    srv9 = HTTPServer(("127.0.0.1", 0), _H3)
+    threading.Thread(target=srv9.serve_forever, daemon=True).start()
+    url9 = f"http://127.0.0.1:{srv9.server_address[1]}/v1"
+    tr9 = Translator(
+        base_url=url9, api_key="k", model="m-a", translate_models=["m-a"],
+        alt_backends=[Backend(name="doubao", base_url=url9, api_key="k2", model="m-doubao")],
+    )
+    tr9.enabled = True
+    notes9: list[str] = []
+    tr9.events_sink = notes9.append
+    for _ in range(5):
+        tr9.translate("hello", "en")
+    # 熔断阈值 2：第 1、2 次失败后熔断；第 3 次是"立即放行探测"（额度可能刚好恢复）；
+    # 第 4、5 次应完全跳过主后端 → 主后端共调用 3 次，备用后端 5 次。
+    check("场景9 主后端熔断后被跳过",
+          calls["primary"] == 3 and calls["alt"] == 5,
+          f"primary调用={calls['primary']} alt调用={calls['alt']} 熔断={tr9._breaker}")
+
+    # 场景 10：主后端恢复后自动切回
+    class _H4(_Handler):
+        state = {"ok": False}
+
+        def do_POST(self):  # noqa: N802
+            body = self._read_body()
+            if body.get("model") == "m-a":
+                if self.state["ok"]:
+                    self._send(200, {"choices": [{"message": {"content": "主后端译文"}}]})
+                else:
+                    self._send(403, {"error": {"message": "额度不足"}})
+            else:
+                self._send(200, {"choices": [{"message": {"content": "豆包译文"}}]})
+
+    srv10 = HTTPServer(("127.0.0.1", 0), _H4)
+    threading.Thread(target=srv10.serve_forever, daemon=True).start()
+    url10 = f"http://127.0.0.1:{srv10.server_address[1]}/v1"
+    tr10 = Translator(
+        base_url=url10, api_key="k", model="m-a", translate_models=["m-a"],
+        alt_backends=[Backend(name="doubao", base_url=url10, api_key="k2", model="m-doubao")],
+    )
+    tr10.enabled = True
+    tr10.events_sink = lambda m: None
+    for _ in range(3):
+        tr10.translate("hello", "en")
+    _H4.state["ok"] = True            # 额度恢复
+    tr10._last_probe = None           # 强制立即放行探测
+    out10 = tr10.translate("hello again", "en")
+    check("场景10 主后端恢复后自动切回",
+          out10 == "主后端译文" and tr10._breaker.get("primary", 0) == 0,
+          f"译文={out10!r} 熔断={tr10._breaker}")
+
+    # 场景 11：预检假阳性 —— /models 返回全量目录（含未开通模型），
+    #   但实际调用 404 ModelNotOpen → 必须判定为不可用。
+    class _H5(_Handler):
+        def do_POST(self):  # noqa: N802
+            self._read_body()
+            self._send(404, {"error": {"code": "ModelNotOpen",
+                                       "message": "has not activated the model"}})
+
+    srv11 = HTTPServer(("127.0.0.1", 0), _H5)
+    threading.Thread(target=srv11.serve_forever, daemon=True).start()
+    url11 = f"http://127.0.0.1:{srv11.server_address[1]}/v1"
+    tr11 = Translator(
+        base_url=url11, api_key="k", model="m-a",
+        alt_backends=[Backend(name="doubao", base_url=url11, api_key="k2",
+                              model="m-doubao")],
+    )
+    ok11, msg11 = tr11.preflight()
+    check("场景11 /models 有目录但模型未开通 → 预检判为不可用",
+          (not ok11) and "未开通" in msg11 or "ModelNotOpen" in msg11,
+          msg11[:150])
+
+    # 场景 12：备用后端持续失败（未开通）不得拖停健康的主后端
+    class _H6(_Handler):
+        def do_POST(self):  # noqa: N802
+            body = self._read_body()
+            if body.get("model") == "m-a":
+                self._send(200, {"choices": [{"message": {"content": "主后端译文"}}]})
+            else:
+                # 备用后端 404（未开通模型）→ 每次都失败
+                self._send(404, {"error": {"code": "ModelNotOpen",
+                                           "message": "not activated"}})
+
+    srv12 = HTTPServer(("127.0.0.1", 0), _H6)
+    threading.Thread(target=srv12.serve_forever, daemon=True).start()
+    url12 = f"http://127.0.0.1:{srv12.server_address[1]}/v1"
+    tr12 = Translator(
+        base_url=url12, api_key="k", model="m-a", translate_models=["m-a"],
+        alt_backends=[Backend(name="doubao", base_url=url12, api_key="k2",
+                              model="m-doubao")],
+    )
+    tr12.enabled = True
+    tr12.events_sink = lambda m: None
+    outs12 = [tr12.translate("hello", "en") for _ in range(6)]
+    # 主后端健康 → 每句都应成功翻译，翻译功能不得被备用后端的 404 拖停
+    check("场景12 备用后端持续404不影响主后端翻译",
+          all(o == "主后端译文" for o in outs12) and tr12.enabled,
+          f"译文={outs12[:2]} enabled={tr12.enabled} "
+          f"全局_fail={tr12._fail} 备用_fail={tr12._backend_fail.get('doubao')}")
+
+    # 场景 13：预检失败不得永久停用翻译 —— 运行期仍应真实重试并成功
+    #   主后端在预检阶段返回 503（模拟"启动那一刻后端抖动"），
+    #   之后恢复正常。预检判不通过，但翻译功能不得被停用。
+    class _H7(_Handler):
+        state = {"fail": True}
+
+        def do_POST(self):  # noqa: N802
+            body = self._read_body()
+            if body.get("model") == "m-a":
+                if self.state["fail"]:
+                    self._send(503, {"error": {"message": "服务暂时不可用"}})
+                else:
+                    self._send(200, {"choices": [{"message": {"content": "恢复后的译文"}}]})
+            else:
+                self._send(404, {"error": {"code": "ModelNotOpen",
+                                           "message": "not activated"}})
+
+    srv13 = HTTPServer(("127.0.0.1", 0), _H7)
+    threading.Thread(target=srv13.serve_forever, daemon=True).start()
+    url13 = f"http://127.0.0.1:{srv13.server_address[1]}/v1"
+    tr13 = Translator(
+        base_url=url13, api_key="k", model="m-a", translate_models=["m-a"],
+        alt_backends=[Backend(name="doubao", base_url=url13, api_key="k2",
+                              model="m-doubao")],
+    )
+    ok13, msg13 = tr13.preflight()
+    check("场景13 预检失败不永久停用翻译",
+          (not ok13) and tr13.enabled,
+          f"ok={ok13} enabled={tr13.enabled} msg={msg13[:80]}")
+    _H7.state["fail"] = False          # 后端恢复
+    out13 = tr13.translate("hello", "en")
+    check("场景13b 预检失败后运行期仍能翻译成功",
+          out13 == "恢复后的译文", f"译文={out13!r}")
+
+    for srv in (srv, srv2, srv3, srv5, srv6, srv9, srv10, srv11, srv12, srv13):
+        srv.shutdown()
+
+    n_ok = sum(1 for r in results if r[0] == PASS)
+    print(f"\n=== 结果：{n_ok}/{len(results)} 通过 ===")
+    if n_ok != len(results):
+        print("失败项：")
+        for st, name, detail in results:
+            if st == FAIL:
+                print(f"  - {name}  {detail}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
