@@ -1,13 +1,13 @@
 """翻译后端：OpenAI 兼容协议（/chat/completions）。
 
-可接入 Ollama（本地零密钥）、vLLM、LM Studio、DeepSeek/OpenAI、**火山方舟豆包**等
-任何兼容服务。
+可接入 Ollama（本地零密钥）、vLLM、LM Studio、DeepSeek/OpenAI，以及任何
+兼容 OpenAI 协议的商业推理服务。
 
 设计要点：
 - preflight()：启动时快速探测后端，不通则立即停用翻译，绝不拖慢识别主循环；
 - translate()：单次调用带超时，失败即返回空串并累计失败次数，达到阈值自动停用；
-- 多后端回退：主后端连续失败（额度不足/限流/渠道不可用）时，自动切到备用后端
-  （例如豆包），跨服务商兜底，避免会议中途"哑火"。
+- 多后端回退：主后端连续失败（额度不足/限流/渠道不可用）时，自动切到备用后端，
+  跨服务商兜底，避免会议中途"哑火"。
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ class SummaryError(RuntimeError):
 class Backend:
     """一个可用的翻译/总结后端（OpenAI 兼容协议）。
 
-    name 仅用于提示与日志，例如 "agnes"、"doubao"。
+    name 仅用于提示与日志，例如 "primary"、"backup"。
     """
     name: str = "primary"
     base_url: str = ""

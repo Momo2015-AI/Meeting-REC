@@ -1,14 +1,21 @@
-# ============ meeting-listener 配置 ============
+# =============================================================================
+# Meeting-REC 配置文件（通用模板）
+#
 # 所有相对路径均相对于本文件所在目录（项目根目录）。
+#
+# 用法：复制本文件为 config.local.toml 后按需修改本机参数。
+#   config.local.toml 已被 .gitignore 忽略，不会进入版本库；
+#   程序启动时会自动优先加载 config.local.toml，不存在时才用本模板。
+# =============================================================================
 
 [audio]
-sample_rate = 16000        # 采集采样率（Vosk 模型要求 16kHz）
+sample_rate = 16000        # 采集采样率（识别模型要求 16 kHz）
 chunk_ms = 100             # 每次读取的帧长（毫秒）
-save_audio = true          # 是否同时落盘 meeting.wav 供事后校正（16k/16bit/mono ≈ 115MB/小时）
+save_audio = true          # 是否同时落盘 meeting.wav 供事后校正（16 kHz/16 bit/单声道 ≈ 115 MB/小时）
 
 [asr]
-lib_dir = "models/lib"     # libvosk.dll 及 MinGW 运行时所在目录
-model_dir = "models/vosk-model-small-en-us-0.15"     # ★ 英文会议：英文识别模型
+lib_dir = "models/lib"     # 识别引擎运行时（libvosk.dll 及依赖）所在目录
+model_dir = "models/vosk-model-small-en-us-0.15"   # 英文会议用英文模型
 source_lang = "en"         # 会议发言语言：en | zh
 partial_interval = 0.3     # 中间结果刷新间隔（秒）
 
@@ -18,55 +25,49 @@ partial_interval = 0.3     # 中间结果刷新间隔（秒）
 
 [translate]
 enabled = true
-backend = "openai_compatible"      # openai_compatible | none（none=仅转写不翻译）
-base_url = "https://api.agnes-ai.cn/v1"    # 云端 OpenAI 兼容端点
+backend = "openai_compatible"      # openai_compatible | none（none = 仅转写不翻译）
+
+# 任意 OpenAI 兼容端点（自建网关、云厂商、聚合服务均可）。
+# 下面是占位示例，请替换为你自己的端点、模型与密钥文件。
+base_url = "https://api.example.com/v1"
 api_key_file = "secrets/llm_api_key.txt"    # 密钥单独存放，不写进本文件
-api_key = "unused"                 # 未提供 api_key_file/env 时才用此项
-model = "agnes-2.5-flash"          # 实测 0.76s；pro 档预扣高易触发额度不足
-target_lang = "zh"                 # ★ 翻译目标语言：英文 → 中文
-timeout = 20.0                # 单次翻译超时（秒）——速率限制下偶发排队，勿设太小
+api_key = "unused"                 # 未提供 api_key_file / api_key_env 时才用此项
+model = "your-model-name"          # 端点上的模型标识
+target_lang = "zh"                 # 翻译目标语言：英文 → 中文
+timeout = 20.0                     # 单次翻译超时（秒）——速率限制下偶发排队，勿设太小
+
 # 翻译模型回退链：首选失败（额度不足/限流/渠道不可用）自动降级到下一档。
-# 顺序按实测成功率排：flash 预扣低、最易通过；pro 预扣高易 403（额度不足）。
-fallback_models = ["agnes-2.5-flash", "agnes-3.0-flash", "agnes-2.5-pro"]
-system_prompt = "你是资深的储能行业会议同声传译，把英文会议发言翻译成中文。要求：译文准确、专业术语统一（EVE 产品型号、认证标准编号如 NFPA 855 / UL 9540A / IEC 62619 / VDE-AR-N 4105 等须原样保留）、表达符合中文商务习惯；只输出译文本身，不要解释，不要加引号。"
+fallback_models = ["your-model-name", "your-fallback-model"]
+
+# 译文风格约束，可按你的行业/项目自定义。
+system_prompt = "你是专业的会议同声传译。译文准确、术语统一、符合目标语言商务习惯；型号与标准编号等专有名词原样保留；只输出译文本身，不要解释，不要加引号。"
 
 # ---- 若本机装了 Ollama，优先用本地模型（音频/文本均不出网）----
 # base_url = "http://localhost:11434/v1"
 # api_key = "ollama"
 # model = "qwen2.5:7b-instruct"
 
-# ---- 备用后端：火山方舟（免费额度兜底）----
-# 主后端额度耗尽/限流时，自动切到这里继续翻译，会议不中断。
-# 开通方式：
-#   1. 注册火山引擎并完成实名认证（个人即可）
-#   2. 打开 https://console.volcengine.com/ark → API 密钥管理 → 创建 API Key
-#      （形如 ak-xxxx，只显示一次，存到 secrets/ark_api_key.txt）
-#   3. 左侧「开通管理」→ 开通模型（开通即送该模型 50 万 token 免费推理额度）
-#   4. 跑 python scan_ark_all.py 扫描账号真实可用的模型
-# 注意：方舟的 model 填"模型 ID"或"推理接入点 ID"（ep-xxx）均可。
-# ⚠️ 方舟的 GET /models 返回的是**全量模型目录**（137 条），绝大多数本账号未开通，
-#    不能据此判断可用性——必须真实发起一次 chat 调用来验证。
+# ---- 备用后端：主后端额度耗尽/限流时自动切到这里，会议不中断 ----
+# 多个服务商可并列配置，[[translate.alt_backends]] 可重复出现。
+# api_key_file 指向的密钥文件同样不进入版本库。
 [[translate.alt_backends]]
-name = "ark"
+name = "alt-1"
 enabled = true
-base_url = "https://ark.cn-beijing.volces.com/api/v3"
-api_key_file = "secrets/ark_api_key.txt"
+base_url = "https://your-backup-endpoint.example.com/v1"
+api_key_file = "secrets/alt_api_key.txt"
 api_key = "unused"
-# 实测 2026-10-22：本账号已开通并稳定可用的模型。
-# deepseek-v4-1-flash-economy-261017 —— 6/6 成功，翻译质量好（术语完整保留）。
-# doubao-seed-2-1-lite-260915 —— 方舟多节点开通未同步，实测 6 次仅 2 次成功，放次级。
-model = "deepseek-v4-1-flash-economy-261017"
-fallback_models = ["deepseek-v4-1-flash-economy-261017", "doubao-seed-2-1-lite-260915"]
+model = "your-backup-model"
+fallback_models = ["your-backup-model", "your-backup-model-2"]
 
 [summary]
-enabled = true             # 点击"停止"后自动总结 MD 文档
+enabled = true             # 点击「停止」后自动总结纪要文档
 timeout = 60.0             # 总结调用超时（秒，长文本需要更久）
 max_chars = 12000          # 送入总结的转写文本上限（超出截断，防超上下文）
 language = "zh"            # 总结输出语言
 # 总结模型回退链：首选失败（余额不足/渠道不可用/超时）自动降级到下一档。
-# 实测 2026-10-22：agnes-2.5-pro 预扣金额高易触发额度不足，flash 档可正常通过。
-fallback_models = ["agnes-2.5-flash", "agnes-3.0-flash", "agnes-2.5-pro"]
-system_prompt = "你是一位资深的储能行业项目经理助理，负责为会议纪要撰写结构化总结。严格按以下 Markdown 结构输出，不要有多余寒暄：\n\n## 会议概要\n（一段话概括会议主题、时长与主要参与方）\n\n## 核心要点\n- 用无序列表列出 3-8 条关键讨论内容，每条一句话，保留关键型号与标准编号\n\n## 决议事项\n- 用无序列表列出明确达成的结论与共识；若无则写\"本次会议未形成明确决议\"\n\n## 待办事项\n- 用无序列表列出行动项，格式：**[负责人/责任方] 事项（期限）**；若无则写\"暂无明确待办\"\n\n## 风险与关注点\n- 用无序列表列出待澄清、待确认或有风险的事项；若无则写\"未发现明显风险\"\n\n要求：只依据转写内容，不得臆造人名、日期、数字或决议；无法判断的信息标注\"（转写未明确）\"。"
+fallback_models = ["your-model-name", "your-fallback-model"]
+# 总结结构可按你的会议规范调整；此处为通用五段式。
+system_prompt = "你是专业的会议纪要助理，负责依据转写内容撰写结构化总结。严格按以下 Markdown 结构输出，不要有多余寒暄：\n\n## 会议概要\n（一段话概括会议主题、时长与主要参与方）\n\n## 核心要点\n- 用无序列表列出 3-8 条关键讨论内容，每条一句话，保留关键型号与标准编号\n\n## 决议事项\n- 用无序列表列出明确达成的结论与共识；若无则写\"本次会议未形成明确决议\"\n\n## 待办事项\n- 用无序列表列出行动项，格式：**[负责人/责任方] 事项（期限）**；若无则写\"暂无明确待办\"\n\n## 风险与关注点\n- 用无序列表列出待澄清、待确认或有风险的事项；若无则写\"未发现明显风险\"\n\n要求：只依据转写内容，不得臆造人名、日期、数字或决议；无法判断的信息标注\"（转写未明确）\"。"
 
 [ui]
 enabled = true
@@ -78,4 +79,4 @@ font_size = 13
 autostart = false       # 不自动采集：必须点击「开始」才监听系统音频
 
 [output]
-dir = "output"         # 会议纪要/WAV 输出根目录
+dir = "output"         # 纪要与录音输出根目录

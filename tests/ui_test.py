@@ -13,13 +13,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.config import load_config  # noqa: E402
+from src.config import default_config_path, load_config  # noqa: E402
 from src.transcriber import MeetingTranscriber  # noqa: E402
 from src.ui import SubtitleWindow  # noqa: E402
 
 
 def main() -> int:
-    cfg = load_config(ROOT / "config.toml")
+    cfg = load_config(default_config_path(ROOT))
     cfg.translate.enabled = False
     t = MeetingTranscriber(cfg)
 
@@ -29,10 +29,10 @@ def main() -> int:
     # 模拟真实时序：两条原文先到，译文后到且乱序返回
     t.events.put(("status", "running"))
     t.events.put(("final", "11:02:31", "The capacity is 261 kWh.", 1))
-    t.events.put(("final", "11:02:44", "Site acceptance test in Ghana.", 2))
+    t.events.put(("final", "11:02:44", "Site acceptance test on site.", 2))
     t.events.put(("partial", "the battery energy storage system"))
     # 译文乱序到达：第 2 句先返回
-    t.events.put(("trans", "11:02:44", "加纳现场验收测试。", 2))
+    t.events.put(("trans", "11:02:44", "现场验收测试。", 2))
     t.events.put(("trans", "11:02:31", "容量为 261 千瓦时。", 1))
 
     for _ in range(20):
@@ -59,7 +59,7 @@ def main() -> int:
     if len(lines) >= 4:
         pair_ok = (
             "261 kWh" in lines[0] and "容量为" in lines[1]
-            and "Site acceptance" in lines[2] and "加纳现场验收" in lines[3]
+            and "Site acceptance" in lines[2] and "现场验收" in lines[3]
         )
 
     ok = ("261 kWh" in body and "容量为" in body and "采集中" in status

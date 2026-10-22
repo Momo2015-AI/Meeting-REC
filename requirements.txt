@@ -1,6 +1,11 @@
-# Python 依赖（本机已安装：numpy 2.5.2 / cffi 2.1.1 / soundcard 0.4.6）
+# Python 依赖
 numpy>=2.0
 cffi>=2.0
 soundcard>=0.4.6
-# 注意：识别引擎不使用 vosk Python 包，而是 ctypes 直绑 models/lib/libvosk.dll，
-# 以规避 vosk 包在 Python 3.14 上缺失 srt/requests 等依赖导致的导入失败。
+
+# 说明：
+# 1. 识别引擎不使用 vosk Python 包，而是通过 ctypes 直绑 models/lib/libvosk.dll，
+#    以规避 vosk 包在较新 Python 版本上依赖链不完整导致的导入失败。
+# 2. soundcard 的 Windows 轮子不含 cffi 依赖，需单独安装 cffi。
+# 3. vendor/ 目录内置了 soundcard 与 pycparser 的离线轮子，
+#    可用 pip install --no-deps vendor/*.whl 离线安装。

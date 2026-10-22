@@ -23,7 +23,7 @@ class AsrCfg:
 
 @dataclass
 class BackendCfg:
-    """备用后端配置（跨服务商兜底，如火山方舟豆包）。"""
+    """备用后端配置（跨服务商兜底）。"""
     name: str = "alt"
     base_url: str = ""
     api_key_file: str = ""
@@ -49,7 +49,7 @@ class TranslateCfg:
     # 备用后端列表：主后端整体失败时按顺序顶上（如豆包免费额度兜底）
     alt_backends: list[BackendCfg] = field(default_factory=list)
     system_prompt: str = (
-        "你是资深的储能行业会议同声传译。要求：译文准确、专业术语统一、"
+        "你是专业的会议同声传译。要求：译文准确、专业术语统一、"
         "表达符合目标语言商务习惯；只输出译文本身，不要解释，不要加引号。"
     )
 
@@ -62,7 +62,7 @@ class SummaryCfg:
     language: str = "zh"
     fallback_models: list[str] = field(default_factory=list)
     system_prompt: str = (
-        "你是一位资深的储能行业项目经理助理，负责为会议纪要撰写结构化总结。"
+        "你是专业的会议纪要助理，负责依据转写内容撰写结构化总结。"
         "严格按 Markdown 结构输出：## 会议概要 / ## 核心要点 / ## 决议事项 / "
         "## 待办事项 / ## 风险与关注点。只依据转写内容，不得臆造。"
     )
@@ -102,6 +102,19 @@ class Config:
 def _from_dict(dc_cls, data: dict):
     fields = dc_cls.__dataclass_fields__
     return dc_cls(**{k: v for k, v in data.items() if k in fields})
+
+
+def default_config_path(root: str | Path | None = None) -> Path:
+    """返回默认配置文件路径。
+
+    优先级：本机私有配置 `config.local.toml` > 通用模板 `config.toml`。
+    config.local.toml 用于存放本机专有的端点/模型/密钥路径，不进入版本库。
+    """
+    base = Path(root) if root else Path(__file__).resolve().parent.parent
+    local = base / "config.local.toml"
+    if local.is_file():
+        return local
+    return base / "config.toml"
 
 
 def load_config(path: str | Path) -> Config:

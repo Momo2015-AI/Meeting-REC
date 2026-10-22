@@ -1,7 +1,7 @@
 @echo off
-REM Start meeting-listener in console mode (no UI). Usage: start_headless.bat [seconds]
+REM Start Meeting-REC in console mode (no UI). Usage: start_headless.bat [seconds]
+REM Optional: set the PYTHON var before running to pick a specific interpreter.
 cd /d "%~dp0"
-set "PY=C:\Users\132854\AppData\Local\Programs\Python\Python314\python.exe"
-if not exist "%PY%" set "PY=python"
-"%PY%" run.py --no-ui --duration %1
+if not defined PYTHON set "PYTHON=python"
+"%PYTHON%" run.py --no-ui --duration %1 %2 %3
 pause

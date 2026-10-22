@@ -21,13 +21,11 @@ KEY_FILE = ROOT / "secrets" / "ark_api_key.txt"
 BASE = "https://ark.cn-beijing.volces.com/api/v3"
 
 # 候选模型：翻译用 lite/mini（额度消耗低），总结用 pro（效果更好）。
-# 2026-10-22 实测本账号已开通：deepseek-v4-1-flash-economy-261017（稳定）、
-# doubao-seed-2-1-lite-260915（方舟多节点未同步，偶尔可用）。
+# 各模型的可用性因账号而异，以本脚本的实际探测结果为准。
 CANDIDATES = [
-    ("deepseek-v4-1-flash-economy-261017", "★已开通·翻译首选·实测稳定"),
-    ("doubao-seed-2-1-lite-260915", "已开通·但多节点未同步·偶尔可用"),
     ("doubao-seed-2-0-lite-260428", "翻译备选·免费额度足"),
     ("doubao-seed-2-0-mini-260428", "翻译备选·更省额度"),
+    ("doubao-seed-2-1-lite-260915", "翻译备选·速度较快"),
     ("doubao-seed-2-1-pro-260915", "总结首选·效果最好"),
     ("doubao-seed-2-1-pro-260628", "总结备选"),
     ("doubao-seed-translation-250915", "官方翻译专用模型"),
@@ -136,7 +134,9 @@ def main() -> int:
         print(f"待开通：{', '.join(need_open)}")
 
     if "--set" in sys.argv:
-        cfg = ROOT / "config.toml"
+        cfg = ROOT / "config.local.toml"
+        if not cfg.is_file():
+            cfg = ROOT / "config.toml"
         text = cfg.read_text(encoding="utf-8")
         # 翻译链：优先 lite/mini/economy/flash 这类轻量档；总结链：优先 pro/大参数量
         trans = [m for m in usable
@@ -146,7 +146,7 @@ def main() -> int:
             trans = list(usable)
         if not summ:
             summ = list(usable)
-        # 定位备用后端段（含 name = "ark" 或 "doubao"）并重写其 model / fallback_models
+        # 定位备用后端段（[[translate.alt_backends]]）并重写其 model / fallback_models
         import re
 
         pat = re.compile(
@@ -155,19 +155,18 @@ def main() -> int:
             re.S)
         m = pat.search(text)
         if not m:
-            print("[x] 未在 config.toml 中找到 [[translate.alt_backends]] 段，未做修改")
+            print("[x] 未在配置中找到 [[translate.alt_backends]] 段，未做修改")
             return 1
         new_text = (text[:m.start()]
                     + m.group(1) + json.dumps(trans[0], ensure_ascii=False)
                     + m.group(2) + json.dumps(trans, ensure_ascii=False)
                     + text[m.end():])
-        new_text = new_text.replace('name = "doubao"\nenabled = false',
-                                    'name = "doubao"\nenabled = true')
+        new_text = new_text.replace('enabled = false', 'enabled = true', 1)
         cfg.write_text(new_text, encoding="utf-8")
-        print(f"\n[OK] 已更新 config.toml：备用后端启用，"
+        print(f"\n[OK] 已更新 {cfg.name}：备用后端启用，"
               f"翻译链={trans}，总结链={summ}")
     else:
-        print("\n加 --set 参数可自动把可用模型写入 config.toml")
+        print("\n加 --set 参数可自动把可用模型写入配置文件")
     return 0
 
 

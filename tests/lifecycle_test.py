@@ -22,7 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.config import load_config  # noqa: E402
+from src.config import default_config_path, load_config  # noqa: E402
 from src.transcriber import MeetingTranscriber  # noqa: E402
 from src.ui import SubtitleWindow  # noqa: E402
 
@@ -50,7 +50,7 @@ def blocking_source(on_pcm, on_error):
 
 
 def main() -> int:
-    cfg = load_config(ROOT / "config.toml")
+    cfg = load_config(default_config_path(ROOT))
     cfg.translate.enabled = False          # 不触发真实 LLM
     cfg.summary.enabled = False            # 不触发真实总结
     cfg.audio.save_audio = False

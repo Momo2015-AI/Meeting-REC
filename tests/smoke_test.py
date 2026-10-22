@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.asr import VoskASR  # noqa: E402
-from src.config import load_config  # noqa: E402
+from src.config import default_config_path, load_config  # noqa: E402
 from src.transcriber import MeetingTranscriber  # noqa: E402
 from src.translate import Translator  # noqa: E402
 
@@ -112,7 +112,7 @@ def case_translator_http() -> str:
 
 
 def case_pipeline() -> str:
-    cfg = load_config(ROOT / "config.toml")
+    cfg = load_config(default_config_path(ROOT))
     cfg.translate.enabled = False          # 无真实 LLM 时跳过翻译
     cfg.audio.save_audio = True
     pcm = synth_pcm(2.0)

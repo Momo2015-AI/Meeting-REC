@@ -1,8 +1,15 @@
-# 密钥与本地数据不入库
+# ============ 密钥与本机私有数据不入库 ============
 secrets/*
 # 但保留密钥填写说明模板
 !secrets/*.example
+
+# 本机私有配置（端点/模型/密钥路径）
+config.local.toml
+
+# 会议产物
 output/
+
+# Python 缓存
 __pycache__/
 *.pyc
 .get-pip.py
@@ -10,5 +17,13 @@ __pycache__/
 # 语音模型（约140MB，体积过大不入库；用 scripts/download_models.py 下载）
 models/vosk-model-*/
 models/*.zip
+
 # 本地日志
 logs/
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

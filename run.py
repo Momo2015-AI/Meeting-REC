@@ -41,9 +41,24 @@ from src.config import load_config  # noqa: E402
 from src.transcriber import MeetingTranscriber  # noqa: E402
 
 
+def _resolve_config_path(explicit: str) -> Path:
+    """选择要加载的配置文件。
+
+    优先级：命令行显式指定 > 本机私有配置 config.local.toml > 通用模板 config.toml。
+    config.local.toml 用于存放本机专有的端点/模型/密钥路径，不进入版本库。
+    """
+    if explicit:
+        return Path(explicit).resolve()
+    root = Path(__file__).resolve().parent
+    local = root / "config.local.toml"
+    if local.is_file():
+        return local
+    return root / "config.toml"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="会议实时监听与翻译（本地管线）")
-    ap.add_argument("--config", default="config.toml", help="配置文件路径")
+    ap.add_argument("--config", default="", help="配置文件路径（默认自动选择 config.local.toml > config.toml）")
     ap.add_argument("--no-ui", action="store_true", help="无界面模式（控制台输出）")
     ap.add_argument("--duration", type=float, default=0, help="运行秒数，0=持续直到 Ctrl+C")
     ap.add_argument("--list-devices", action="store_true", help="列出音频输出与环录设备")
@@ -61,7 +76,8 @@ def main() -> int:
             print(f"  [环录] {name}")
         return 0
 
-    cfg = load_config(args.config)
+    cfg = load_config(_resolve_config_path(args.config))
+    print(f"[init] 配置文件：{_resolve_config_path(args.config).name}")
     print(f"[init] 识别模型：{cfg.asr.model_dir}")
     print(f"[init] 语种方向：{cfg.asr.source_lang.upper()} → {cfg.translate.target_lang.upper()}")
     print(f"[init] 翻译后端：{cfg.translate.backend} {cfg.translate.base_url} "

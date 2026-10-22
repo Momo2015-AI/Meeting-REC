@@ -21,7 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.config import load_config  # noqa: E402
+from src.config import default_config_path, load_config  # noqa: E402
 from src.translate import Backend, Translator  # noqa: E402
 
 PASS, FAIL = "PASS", "FAIL"
@@ -171,10 +171,10 @@ def main() -> int:
           f"used={getattr(tr7, 'summary_used_backend', '?')}")
 
     # 场景 8：配置层 alt_backends 解析
-    cfg = load_config(ROOT / "config.toml")
+    cfg = load_config(default_config_path(ROOT))
     alts = cfg.translate.alt_backends
-    ok8 = bool(alts) and alts[0].base_url.startswith("https://ark.")
-    check("场景8 配置解析出豆包备用后端", ok8,
+    ok8 = bool(alts) and alts[0].base_url.startswith("https://")
+    check("场景8 配置解析出备用后端", ok8,
           f"name={alts[0].name if alts else '?'} url={alts[0].base_url if alts else '?'}")
 
     # 场景 9：熔断——主后端连续失败后被跳过，不再重复调用

@@ -4,7 +4,7 @@
     python summarize.py                      # 列出所有缺总结的会话
     python summarize.py output/meeting_2026…  # 指定会话目录（补生成）
     python summarize.py --all                # 补生成所有缺总结的会话
-    python summarize.py --session <dir> --model agnes-2.5-flash
+    python summarize.py --session <dir> --model your-model-name
 """
 from __future__ import annotations
 

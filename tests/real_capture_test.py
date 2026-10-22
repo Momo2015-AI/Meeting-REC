@@ -15,7 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.config import load_config  # noqa: E402
+from src.config import default_config_path, load_config  # noqa: E402
 from src.transcriber import MeetingTranscriber  # noqa: E402
 
 
@@ -25,7 +25,7 @@ def main() -> int:
     wav = ROOT / "tests" / "test.wav"
     assert wav.exists(), f"缺少测试音频 {wav}"
 
-    cfg = load_config(ROOT / "config.toml")
+    cfg = load_config(default_config_path(ROOT))
     cfg.asr.model_dir = "models/vosk-model-small-en-us-0.15"
     cfg.asr.source_lang = "en"
     cfg.translate.enabled = False
