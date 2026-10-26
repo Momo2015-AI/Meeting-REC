@@ -49,6 +49,7 @@ class MeetingTranscriber:
             enabled=cfg.translate.enabled and cfg.translate.backend != "none",
             summary_models=list(cfg.summary.fallback_models),
             translate_models=list(cfg.translate.fallback_models),
+            extra_body=dict(cfg.translate.extra_body),
             alt_backends=[
                 Backend(
                     name=b.name,
@@ -57,6 +58,7 @@ class MeetingTranscriber:
                     model=b.model,
                     translate_models=list(b.fallback_models) or ([b.model] if b.model else []),
                     summary_models=list(b.fallback_models) or ([b.model] if b.model else []),
+                    extra_body=dict(b.extra_body),
                 )
                 for b in cfg.translate.alt_backends
                 if b.enabled and b.base_url and b.api_key
@@ -75,12 +77,14 @@ class MeetingTranscriber:
         self._wav: Optional[wave.Wave_write] = None
         self._write_lock = threading.Lock()
         self.session_dir: Optional[Path] = None
+        self._closed = False                      # 幂等守卫：stop() 重入不重复收尾
         self.transcript_path: Optional[Path] = None
         self.summary_path: Optional[Path] = None
         self._last_partial_push = 0.0
         self._started_at: Optional[datetime] = None
         self._seq_line: dict[int, int] = {}
         self._summary_thread: Optional[threading.Thread] = None
+        self._recent_finals: list[str] = []      # 最近几句原文，供翻译上下文
         self.stats = {"finals": 0, "translated": 0, "pcm_bytes": 0, "summarized": False}
         self.translate_status = ""
 
@@ -103,6 +107,7 @@ class MeetingTranscriber:
         # 每场会议独立统计：否则上一场说过话会让本场误判"有内容"而触发空总结
         self.stats = {"finals": 0, "translated": 0, "pcm_bytes": 0, "summarized": False}
         self._seq_line.clear()
+        self._recent_finals.clear()
         with self._write_lock:
             with open(self.transcript_path, "w", encoding="utf-8") as f:
                 f.write("# 会议双语纪要\n\n")
@@ -155,9 +160,7 @@ class MeetingTranscriber:
         # 去掉分隔线与空行：只剩 "---" 说明本场没有任何转写内容
         lines = [ln for ln in body.splitlines() if ln.strip() and ln.strip() != "---"]
         body = "\n".join(lines)
-        limit = self.cfg.summary.max_chars
-        if limit > 0 and len(body) > limit:
-            body = body[:limit] + "\n\n（转写内容过长，已截断前段）"
+        # 不再截断：超长转写由 Translator.summarize 分块小结后归并（见 max_chars）
         return body.strip()
 
     def _write_summary(self, summary_md: str) -> None:
@@ -208,6 +211,7 @@ class MeetingTranscriber:
             md = self.translator.summarize(
                 content, self.cfg.summary.system_prompt,
                 timeout=self.cfg.summary.timeout,
+                chunk_chars=self.cfg.summary.max_chars,
             )
         except Exception as e:  # noqa: BLE001
             reason = str(e)
@@ -231,6 +235,7 @@ class MeetingTranscriber:
         """开始采集。必须在用户明确点击「开始」后调用。"""
         if self.running:
             return
+        self._closed = False
         self._stop.clear()
         self._active = True
         self._open_session()
@@ -247,7 +252,14 @@ class MeetingTranscriber:
         总结在独立线程异步进行，不阻塞调用方（UI 不会被卡住）。
         wait_summary=True 时同步等待总结落盘后再返回——进程退出前必须走这条路径，
         否则守护线程会随进程一起被杀，summary 丢失。
+
+        幂等：重复调用 stop()（双击停止、Esc+窗口关闭连发）只收尾一次，
+        不重复写"结束时间"尾块。
         """
+        if self._closed:
+            self.events.put(("status", "stopped"))
+            return
+        self._closed = True
         self._active = False
         self._stop.set()
         # 让阻塞中的采集循环退出，并释放系统音频设备句柄
@@ -326,23 +338,39 @@ class MeetingTranscriber:
                     self.events.put(("partial", part))
 
         def on_error(exc: Exception) -> None:
-            self.events.put(("error", f"音频采集失败：{exc}"))
-            self._stop.set()
+            # 只报告，不终止：由下面的重连循环决定是否恢复（设备热拔插场景）
+            self.events.put(("error", f"音频采集异常：{exc}"))
 
         # 采集源：真实场景用 LoopbackCapture（阻塞式，stop() 时退出）；
         # 测试场景可注入 pcm_source（约定为阻塞式，同样需在 stop 后返回）。
         if self._pcm_source is not None:
             self._pcm_source(on_pcm, on_error)
             return
-        self._capture = LoopbackCapture(
-            sample_rate=self.cfg.audio.sample_rate, chunk_ms=self.cfg.audio.chunk_ms
-        )
-        try:
-            self._capture.start(on_pcm, on_error)
-        except RuntimeError as e:
-            # 设备不可用（如没有输出设备）——作为错误提示，不静默失败
-            self.events.put(("error", str(e)))
-            self._stop.set()
+
+        attempts = max(1, int(getattr(self.cfg.audio, "reconnect_attempts", 5) or 5))
+        delay = float(getattr(self.cfg.audio, "reconnect_delay", 3.0) or 3.0)
+        attempt = 0
+        while not self._stop.is_set():
+            # 每次重连都重新解析默认输出设备——耳机拔插后设备名/句柄都会变
+            self._capture = LoopbackCapture(
+                sample_rate=self.cfg.audio.sample_rate, chunk_ms=self.cfg.audio.chunk_ms
+            )
+            try:
+                self._capture.start(on_pcm, on_error)
+            except RuntimeError as e:
+                # 设备不可用（如没有输出设备）——提示后延时重试
+                self.events.put(("error", str(e)))
+            self._capture = None
+            if self._stop.is_set():
+                break
+            attempt += 1
+            if attempt >= attempts:
+                self.events.put(("error", f"音频重连 {attempt} 次失败，停止本场采集"))
+                self._stop.set()
+                break
+            self.events.put(("note",
+                             f"音频中断，{delay:.0f}s 后重连（{attempt}/{attempts}）…"))
+            self._stop.wait(delay)   # 可被 stop() 立即打断
 
     def _on_final(self, text: str) -> None:
         now = datetime.now()
@@ -355,28 +383,61 @@ class MeetingTranscriber:
                 f.write(f"- **[{ts}]** {text}\n")
                 f.flush()
                 self._seq_line[seq] = f.tell()
+        # 携带此前几句原文作上下文（统一术语、正确指代），与句序号一起入队
+        n_ctx = int(getattr(self.cfg.translate, "context_sentences", 0) or 0)
+        ctx = list(self._recent_finals[-n_ctx:]) if n_ctx > 0 else []
         self.events.put(("final", ts, text, seq))
         if self.translator.enabled:
-            self._trans_q.put((ts, text, seq))
+            self._trans_q.put((ts, text, seq, ctx))
+        self._recent_finals.append(text)
+        if len(self._recent_finals) > 8:
+            self._recent_finals = self._recent_finals[-8:]
 
     # ---------------- 翻译线程 ----------------
     def _run_translate(self) -> None:
+        """翻译消费线程：支持批量凑批（batch_size/batch_wait），不阻塞识别。"""
+        bsize = max(1, int(getattr(self.cfg.translate, "batch_size", 1) or 1))
+        bwait = float(getattr(self.cfg.translate, "batch_wait", 0.4) or 0.0)
         while True:
             item = self._trans_q.get()
             if item[0] == "__stop__":
                 return
-            ts, text, seq = item
+            batch = [item]
+            if bsize > 1:
+                # 短窗口内凑批：来句快（多人讨论）时合并请求省钱省时；
+                # 窗口结束或队伍空了立即开翻，不牺牲延迟
+                deadline = time.monotonic() + bwait
+                while len(batch) < bsize:
+                    remain = deadline - time.monotonic()
+                    if remain <= 0:
+                        break
+                    try:
+                        nxt = self._trans_q.get(timeout=remain)
+                    except queue.Empty:
+                        break
+                    if nxt[0] == "__stop__":
+                        self._trans_q.put(nxt)   # 挪到队尾，下一轮退出
+                        break
+                    batch.append(nxt)
+            texts = [b[1] for b in batch]
+            ctxs = [b[3] for b in batch]
             try:
-                trans = self.translator.translate(text, self.cfg.asr.source_lang)
+                if len(texts) == 1:
+                    trans_list = [self.translator.translate(
+                        texts[0], self.cfg.asr.source_lang, ctxs[0])]
+                else:
+                    trans_list = self.translator.translate_batch(
+                        texts, self.cfg.asr.source_lang, ctxs)
             except Exception as e:  # noqa: BLE001
                 self.events.put(("error", f"翻译失败：{e}"))
                 continue
-            if not trans:
-                continue
-            self.stats["translated"] += 1
-            with self._write_lock:
-                self._write_translation(seq, trans)
-            self.events.put(("trans", ts, trans, seq))
+            for (ts, _text, seq, _ctx), trans in zip(batch, trans_list):
+                if not trans:
+                    continue
+                self.stats["translated"] += 1
+                with self._write_lock:
+                    self._write_translation(seq, trans)
+                self.events.put(("trans", ts, trans, seq))
 
     def _write_translation(self, seq: int, trans: str) -> None:
         """把译文写回对应原文句之后（原文与译文始终成对相邻）。"""

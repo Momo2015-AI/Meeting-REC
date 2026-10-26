@@ -96,6 +96,12 @@ Meeting-REC 是一个**完全跑在你自己电脑上**的会议记录工具。
 | **预检失败不禁用翻译** | 启动时探测失败只记录状态，首句仍真实重试，避免误判导致全程无译文 |
 | **同秒重开会话加后缀** | 目录名精确到秒时同秒重开会覆盖上一场，加 `_2`/`_3` 后缀杜绝覆盖 |
 | **手动开始而非自动采集** | 打开工具不代表立刻录音，避免无意录下私人音频 |
+| **翻译带上下文 / 批处理** | 携带前几句原文稳定术语与指代；密集发言时合并请求，省钱省时，漏行自动逐句回退 |
+| **推理模型关思考** | 火山方舟 deepseek/seed 系列默认先内部推理再翻译，长句会烧满配额甚至整场零译文；`extra_body = { thinking = { type = "disabled" } }` 强制关闭，实测 1-3 秒出译文 |
+| **长会议完整总结** | 转写过长时自动分块小结后归并，不再截断丢后半场 |
+| **设备热拔插重连** | 耳机拔插/默认设备切换导致环录中断后，自动重连新输出设备，录音无缝续写 |
+| **whisper 离线重识别** | 一键用 whisper.cpp 重转写本场 WAV，修正 Vosk small 模型的识别误差 |
+| **单实例拉起** | 重复启动 `run.py` 不会开第二个窗口，自动把已有字幕窗调至前台 |
 
 ---
 
@@ -117,13 +123,21 @@ python run.py
 <summary><b>1. 安装依赖</b></summary>
 
 ```powershell
-python -m pip install --user numpy
-python -m pip install --user --no-deps vendor\pycparser.whl vendor\soundcard-0.4.6-py3-none-any.whl
-python -m pip install --user cffi
+# 建议用 venv，而不是 --user 装进系统 Python
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install numpy "soundcard==0.4.6" cffi
 ```
 
-> 仓库已内置 `vendor/` 离线 wheel（`soundcard`、`pycparser`），换网络环境也能装。
-> `cffi` 是 `soundcard` 的编译依赖，若拉取失败可从任意同 ABI 的 Python 3.14 环境拷贝 `cffi/` 与 `_cffi_backend*.pyd`。
+> **踩坑笔记（2026-10-23）**：在一台 Windows 10 + Python 3.14 的公司电脑上，
+> `--user` 装进系统解释器的库被 DLP 文件加密策略批量改写（`.py` → `.IPGSD`），
+> 之后 `import soundcard` 变成空壳 namespace 包，报
+> `module 'soundcard' has no attribute 'default_speaker'`。
+> 解决：改用项目内 venv（新写入的文件不受该策略影响），或用管理员白名单目录。
+> 排查方法：`import soundcard; print(soundcard.__path__)` 出现
+> `_NamespacePath(...)` 即说明 `__init__.py` 已被加密破坏。
+
+> 仓库内置 `vendor/` 离线 wheel（`soundcard`、`pycparser`），离线环境可用：
+> `.venv\Scripts\python.exe -m pip install --no-deps vendor\pycparser.whl vendor\soundcard-0.4.6-py3-none-any.whl`
 
 </details>
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import queue as queue_mod
 import tkinter as tk
+from pathlib import Path
 
 from .transcriber import MeetingTranscriber
 
@@ -71,6 +72,12 @@ class SubtitleWindow:
                                  fg="#c9d1d9", relief="flat",
                                  font=("Microsoft YaHei", 9), cursor="hand2")
         self.dir_btn.pack(side="right", padx=4, pady=4)
+        # 离线重识别：用 whisper.cpp 对本场 meeting.wav 重新转写（Vosk small 快而糙，
+        # whisper small 慢而准；识别质量不满意时可事后校正）
+        self.rs_btn = tk.Button(bar, text="重识别", command=self._rescore, bg="#30363d",
+                                fg="#c9d1d9", relief="flat",
+                                font=("Microsoft YaHei", 9, "italic"), cursor="hand2")
+        self.rs_btn.pack(side="right", padx=4, pady=4)
         for w in (bar, self.status, self.lang_lbl, self.tr_lbl):
             w.bind("<ButtonPress-1>", self._press)
             w.bind("<B1-Motion>", self._motion)
@@ -159,6 +166,54 @@ class SubtitleWindow:
     def _open_dir(self) -> None:
         if self.t.session_dir and self.t.session_dir.exists():
             os.startfile(str(self.t.session_dir))  # noqa: S606
+
+    def _rescore(self) -> None:
+        """一键离线重识别：whisper 重转写本次会议 WAV，产出 transcript_whisper.md。
+
+        后台线程跑子进程，避免卡住 tkinter 主循环；运行中按钮置禁用。
+        """
+        import threading as _threading
+
+        cfg = self.cfg
+        if not getattr(cfg, "rescore", None) or not cfg.rescore.enabled:
+            self._append("重识别未启用（config [rescore] enabled=false）", "note")
+            return
+        if self.t.session_dir is None or not (self.t.session_dir / "meeting.wav").is_file():
+            self._append("本次会话没有录音文件（可能未开启 save_audio）", "err")
+            return
+        wav = self.t.session_dir / "meeting.wav"
+        if getattr(self, "_rescoring", False):
+            return
+        self._rescoring = True
+        self.rs_btn.config(text="识别中…", state="disabled")
+
+        def work() -> None:
+            import subprocess
+            import sys as _sys
+
+            script = Path(__file__).resolve().parent.parent / "scripts" / "rescore_whisper.py"
+            cmd = [_sys.executable, str(script), str(wav)]
+            if cfg.rescore.lang:
+                cmd += ["--lang", cfg.rescore.lang]
+            try:
+                r = subprocess.run(cmd, capture_output=True, encoding="utf-8",
+                                   errors="replace", timeout=3600)
+                out = (r.stdout or "") + (r.stderr or "")
+                # 事件进轮询队列，避免跨线程直接动 UI 控件
+                self.t.events.put(("note", f"重识别完成：transcript_whisper.md（whisper）"
+                                           f"{'；脚本提示：' + out.strip()[-160:] if r.returncode else ''}"))
+            except Exception as e:  # noqa: BLE001
+                self.t.events.put(("error", f"重识别失败：{e}"))
+            finally:
+                self._rescoring = False
+                try:
+                    self.root.after(0, lambda: self.rs_btn.config(
+                        text="重识别", state="normal"))
+                except Exception:  # noqa: BLE001
+                    pass
+
+        self._append("已启动 whisper 离线重识别（产出 transcript_whisper.md，完成后在界面提示）…", "note")
+        _threading.Thread(target=work, daemon=True).start()
 
     def _on_close(self) -> None:
         """退出：必须等总结落盘后再销毁窗口。

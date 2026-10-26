@@ -12,6 +12,8 @@
 sample_rate = 16000        # 采集采样率（识别模型要求 16 kHz）
 chunk_ms = 100             # 每次读取的帧长（毫秒）
 save_audio = true          # 是否同时落盘 meeting.wav 供事后校正（16 kHz/16 bit/单声道 ≈ 115 MB/小时）
+reconnect_attempts = 5     # 耳机拔插/默认设备切换导致环录中断后的自动重连次数
+reconnect_delay = 3.0      # 每次重连间隔秒数
 
 [asr]
 lib_dir = "models/lib"     # 识别引擎运行时（libvosk.dll 及依赖）所在目录
@@ -39,6 +41,12 @@ timeout = 20.0                     # 单次翻译超时（秒）——速率限�
 # 翻译模型回退链：首选失败（额度不足/限流/渠道不可用）自动降级到下一档。
 fallback_models = ["your-model-name", "your-fallback-model"]
 
+# 翻译时携带前几句原文作上下文（统一术语、正确指代），0=关闭。
+context_sentences = 3
+# 批处理：句子密集时合并一次请求（省钱省时）；窗口内凑不到下一句立即开翻。
+batch_size = 3
+batch_wait = 0.4
+
 # 译文风格约束，可按你的行业/项目自定义。
 system_prompt = "你是专业的会议同声传译。译文准确、术语统一、符合目标语言商务习惯；型号与标准编号等专有名词原样保留；只输出译文本身，不要解释，不要加引号。"
 
@@ -62,7 +70,7 @@ fallback_models = ["your-backup-model", "your-backup-model-2"]
 [summary]
 enabled = true             # 点击「停止」后自动总结纪要文档
 timeout = 60.0             # 总结调用超时（秒，长文本需要更久）
-max_chars = 12000          # 送入总结的转写文本上限（超出截断，防超上下文）
+max_chars = 12000          # 单块送入 LLM 的转写上限；超出自动分块小结+归并总结（不再截断）
 language = "zh"            # 总结输出语言
 # 总结模型回退链：首选失败（余额不足/渠道不可用/超时）自动降级到下一档。
 fallback_models = ["your-model-name", "your-fallback-model"]
@@ -80,3 +88,9 @@ autostart = false       # 不自动采集：必须点击「开始」才监听系
 
 [output]
 dir = "output"         # 纪要与录音输出根目录
+
+[rescore]              # 离线重识别：whisper.cpp 重转写 meeting.wav（UI「重识别」按钮）
+enabled = true
+whisper_cli = ""       # 留空自动寻找本机已有 whisper.cpp（wc*/Release/whisper-cli.exe）
+model = ""             # 留空自动选择量化模型（如 ggml-small-q8_0.bin）
+lang = "auto"

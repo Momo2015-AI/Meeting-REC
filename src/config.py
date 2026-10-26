@@ -11,6 +11,8 @@ class AudioCfg:
     sample_rate: int = 16000
     chunk_ms: int = 100
     save_audio: bool = True
+    reconnect_attempts: int = 5      # 设备断开（拔耳机/切默认设备）后自动重连次数
+    reconnect_delay: float = 3.0     # 每次重连等待秒数
 
 
 @dataclass
@@ -32,6 +34,7 @@ class BackendCfg:
     model: str = ""
     fallback_models: list[str] = field(default_factory=list)
     enabled: bool = True
+    extra_body: dict = field(default_factory=dict)   # 透传到请求体的附加字段（如火山方舟 thinking）
 
 
 @dataclass
@@ -52,13 +55,17 @@ class TranslateCfg:
         "你是专业的会议同声传译。要求：译文准确、专业术语统一、"
         "表达符合目标语言商务习惯；只输出译文本身，不要解释，不要加引号。"
     )
+    context_sentences: int = 3      # 翻译时携带的前几句原文作上下文（0=关闭）
+    batch_size: int = 3             # 翻译批处理：一次请求最多合并几句（1=逐句）
+    batch_wait: float = 0.4         # 凑批最长等待秒数（队列空闲时不再等）
+    extra_body: dict = field(default_factory=dict)   # 主后端请求体附加字段（火山方舟关闭思考等）
 
 
 @dataclass
 class SummaryCfg:
     enabled: bool = True
     timeout: float = 60.0
-    max_chars: int = 12000
+    max_chars: int = 12000          # 单块送入 LLM 的转写字符数上限；超出时自动分块小结+归并总结
     language: str = "zh"
     fallback_models: list[str] = field(default_factory=list)
     system_prompt: str = (
@@ -85,6 +92,15 @@ class OutputCfg:
 
 
 @dataclass
+class RescoreCfg:
+    """whisper.cpp 离线重识别（scripts/rescore_whisper.py 的 UI 集成配置）。"""
+    enabled: bool = True
+    whisper_cli: str = ""           # 留空自动寻找本机 whisper.cpp 环境
+    model: str = ""                 # 留空自动选择量化模型
+    lang: str = "auto"
+
+
+@dataclass
 class Config:
     base_dir: Path
     audio: AudioCfg
@@ -93,6 +109,7 @@ class Config:
     summary: SummaryCfg
     ui: UiCfg
     output: OutputCfg
+    rescore: RescoreCfg
 
     def resolve(self, p: str) -> Path:
         path = Path(p)
@@ -132,6 +149,7 @@ def load_config(path: str | Path) -> Config:
         summary=_from_dict(SummaryCfg, raw.get("summary", {})),
         ui=_from_dict(UiCfg, raw.get("ui", {})),
         output=_from_dict(OutputCfg, raw.get("output", {})),
+        rescore=_from_dict(RescoreCfg, raw.get("rescore", {})),
     )
     # 备用后端（[[translate.alt_backends]] 数组表）
     cfg.translate.alt_backends = [

@@ -128,6 +128,11 @@ def main() -> int:
 
     from src.ui import SubtitleWindow
 
+    if _bump_existing_window():
+        print("[run] 检测到已运行的字幕窗，已将其调至前台，本次启动退出。")
+        time.sleep(0.8)   # 给 print 一点落盘时间（pythonw 无控制台时无害）
+        return 0
+
     SubtitleWindow(cfg, t).run()
     return 0
 
@@ -152,6 +157,41 @@ def _drain_console(t: MeetingTranscriber) -> None:
                 print(f"\n[note] {ev[1]}")
     except queue_mod.Empty:
         pass
+
+
+def _bump_existing_window() -> bool:
+    """已有实例时，自动把旧进程的字幕窗拉到前台并退出本次启动。
+
+    EnumWindows 按标题精确匹配 tk 主窗口「会议实时字幕」（UI 模式独有标题，
+    排除总结子窗等），找到后 SW_RESTORE + SetForegroundWindow。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes as wt
+
+        user32 = ctypes.windll.user32
+        old_last_error = ctypes.get_last_error()
+        found = []
+
+        @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+        def _enum(hwnd, _lp):
+            buf = ctypes.create_unicode_buffer(32)
+            user32.GetWindowTextW(hwnd, buf, 32)
+            if buf.value == "会议实时字幕":
+                found.append(hwnd)
+                return 0
+            return 1
+
+        user32.EnumWindows(_enum, 0)
+        ctypes.set_last_error(old_last_error)
+        if not found:
+            return False
+        hwnd = found[0]
+        user32.ShowWindow(hwnd, 9)          # SW_RESTORE
+        user32.SetForegroundWindow(hwnd)    # 置顶已由窗口自身 attributes 保证
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 if __name__ == "__main__":
