@@ -31,20 +31,25 @@ Meeting-REC 是一个**完全跑在你自己电脑上**的会议记录工具。
 > 密钥只放在你的本机 `secrets/` 目录，该目录已被 `.gitignore` 排除。
 > 语音模型体积较大（约 140 MB），同样不入库，提供一键下载脚本。
 
-> **识别引擎可选**：默认 Vosk（流式逐词）；`[asr]` 改 `engine = "sensevoice"` 切换到
-> SenseVoice-Small（阿里达摩院 FunASR）——识别准确率显著更高、自带标点，
+> **识别引擎可选**：默认 Vosk（流式逐词）；也可切换到 SenseVoice-Small
+> （阿里达摩院 FunASR）——识别准确率显著更高、自带标点，
 > 切句由流式 Fsmn-VAD 完成（停顿即断句、超长自动强制断句），连续语速下翻译提早数秒。
+> 字幕窗右上角的**引擎下拉框可在运行时直接切换**，不必改配置、不必重启。
 > 模型下载：`python scripts/download_sensevoice.py`（ModelScope 国内直连 ≈ 940 MB）。
 
 > **onnxruntime 版本与 Python ABI 的硬约束**（2026-10-27 实测）：
 > `onnxruntime==1.20.1` 只发布到 **cp313**（Python 3.13），**没有 cp314（Python 3.14）轮子**；
 > 而 cp314 的 onnxruntime（1.24.1 起）在本机加载 pybind11 扩展会失败：
 > `ImportError: DLL load failed ... 动态链接库(DLL)初始化例程失败`（WinError 1114）。
-> **结论：要用 SenseVoice 引擎，解释器必须用 Python ≤ 3.13**（推荐 3.13 + `onnxruntime==1.20.1`）。
+> **结论：要用 SenseVoice 引擎，解释器必须用 Python ≤ 3.13**（推荐 3.12 + `onnxruntime==1.20.1`）。
 > 用 Python 3.14 请把 `[asr] engine` 保持为 `"vosk"`（仅依赖 `models/lib/libvosk.dll`，无 ABI 约束）。
 >
 > 另注：`funasr-onnx` 声明 `numpy<=1.26.4`，但 numpy 1.26.4 无 cp313 轮子，
 > 实际需装 `numpy==2.2.6` 并用 `--no-deps` 绕过该约束（运行时无兼容问题）。
+>
+> **`sentencepiece` 必须钉 `0.2.0`**：0.2.1 / 0.2.2 的 `Load()` 在本机一律段错误
+> （exit 139，崩在 pyd 内部，与文件是否被加密无关）。完整排查见下文
+> 「SenseVoice 可用性排查」。
 
 ---
 
@@ -53,7 +58,8 @@ Meeting-REC 是一个**完全跑在你自己电脑上**的会议记录工具。
 | 能力 | 说明 |
 |---|---|
 | **系统音频环录** | 基于 WASAPI Loopback，抓取默认输出设备的混音，无需虚拟声卡 |
-| **流式语音识别** | Vosk 引擎本地推理，16 kHz 单声道，实时出字（partial），句子完成即定稿（final） |
+| **双识别引擎** | Vosk（流式逐词）与 SenseVoice（块级整句）双引擎，界面下拉框**运行时即时切换**，无需重启 |
+| **流式语音识别** | 16 kHz 单声道，实时出字（partial），句子完成即定稿（final）；停止时冲刷末句不丢内容 |
 | **实时翻译** | 任意 OpenAI 兼容 `/chat/completions` 端点，独立工作线程，翻译卡顿不阻塞识别 |
 | **多后端回退** | 主后端连续失败自动熔断，切换备用服务商；60 秒后自动探测恢复 |
 | **模型回退链** | 同一后端内多个模型按顺序降级，抵御单模型限流 |
@@ -80,10 +86,15 @@ Meeting-REC 是一个**完全跑在你自己电脑上**的会议记录工具。
                     └──────────────────┬──────────────────────────┘
                                        │ PCM frames
                     ┌──────────────────▼──────────────────────────┐
-                    │              识别层 (asr.py)                 │
-                    │  ctypes 直绑 libvosk.dll（无需 vosk Python 包）│
+                    │         识别层 (build_asr 工厂)             │
+                    │  ┌────────────┐   ┌──────────────────────┐  │
+                    │  │ VoskASR    │   │ SenseVoiceStream     │  │
+                    │  │ ctypes 直绑 │   │ funasr-onnx + VAD     │  │
+                    │  │ libvosk.dll│   │ 块级整句 · 停顿即断句  │  │
+                    │  └────────────┘   └──────────────────────┘  │
                     │  → partial 实时中间结果                      │
-                    │  → final  完整语句                           │
+                    │  → final  完整语句（停止时冲刷末句）          │
+                    │  ★ 运行时可切换（UI 下拉框），失败自动回滚      │
                     └──────────────────┬──────────────────────────┘
                                        │ 文本事件
                     ┌──────────────────▼──────────────────────────┐
@@ -220,12 +231,63 @@ python launch.py --detach        # 以独立进程挂机运行
 |---|---|
 | **▶ 开始** | 开始监听系统音频。**打开工具不会自动录音**，必须主动点击 |
 | **■ 停止** | 结束本场会议，关闭录音文件并自动生成会议总结 |
+| **引擎下拉框** | 切换识别引擎（Vosk ↔ SenseVoice），**运行时即时生效，无需重启** |
 | **清屏** | 只清空字幕界面显示，已写入的 Markdown / WAV **完全保留** |
 | **打开目录** | 打开本次会话的输出文件夹 |
 | **拖动标题栏** | 移动字幕窗位置 |
 | **`Esc`** | 退出应用（退出时自动收尾，纪要不丢） |
 
 顶部状态栏从左到右：采集状态（● 待开始 / 采集中 / 总结中 / 已停止）→ 语种方向 → 翻译后端徽标（翻译已就绪 / 仅转写）→ 降级徽标。
+
+### 🔀 识别引擎切换
+
+字幕窗右上角有一个**引擎下拉框**，可在运行时切换识别引擎，不必改配置、不必重启程序：
+
+| 引擎 | 特点 | 适用场景 |
+|---|---|---|
+| **Vosk** | 流式逐词，模型小、启动快，**无 Python ABI 约束** | 英文会议、追求低延迟、Python 3.14 环境 |
+| **SenseVoice** | 块级整句，识别更准、停顿即断句 | 中文/多语种会议、追求准确度（**需 Python ≤ 3.13**） |
+
+切换行为的设计要点：
+
+- **采集中不可切换**：识别器实例正被采集线程调用，换掉会撕裂状态。此时下拉框自动置灰，点击「停止」后恢复可用。
+- **后台加载，不卡界面**：SenseVoice 首次加载需读模型（约 4 秒），切换在后台线程执行，界面保持响应。
+- **失败不破坏现状**：依赖缺失、模型未下载、ABI 不兼容等情况下切换会失败，此时**保持原引擎继续工作**，并把失败原因写进提示区（如 `✗ 切换到 sensevoice 失败：模型目录不存在：…`），下拉框回滚到当前真实引擎，绝不出现「显示与实际不一致」的中间态。
+- **线程安全**：后台线程的结果经队列回主线程处理。tkinter 不是线程安全的，跨线程直接调 `root.after()` 会抛 `main thread is not in main loop`，本项目不采用该写法。
+
+切换后当前会话的 `transcript.md` 头部会记录实际使用的引擎。切换不写配置文件，重启后仍以 `config.toml` / `config.local.toml` 中的 `[asr] engine` 为准——**想固化选择就改配置**。
+
+### SenseVoice 可用性排查（2026-10-27 实测结论）
+
+SenseVoice 依赖 ONNX 运行时与分词器，版本组合非常挑剔。以下是逐项实测后固化的结论，**照做即可跑通**：
+
+| 症状 | 根因 | 解决 |
+|---|---|---|
+| `ImportError: DLL load failed ... 初始化例程失败 (WinError 1114)` | `onnxruntime` 与 Python ABI 不匹配 | Python 必须 **≤ 3.13**（推荐 3.12）；`onnxruntime==1.20.1` |
+| 加载模型时段错误 `exit 139`（faulthandler 显示崩在 `LoadFromFile`） | `sentencepiece` 0.2.1 / 0.2.2 的 pyd 崩溃 | **钉 `sentencepiece==0.2.0`**（0.2.1/0.2.2 一律段错误） |
+| `funasr-onnx` 安装时 numpy 版本冲突 | 它声明 `numpy<=1.26.4`，而 1.26.4 无 cp313 轮子 | 装 `numpy==2.2.6`，并对 funasr-onnx 用 `--no-deps` |
+| 识别结果只有前半句，尾部丢失 | VAD 只在检测到后续静音时闭合分段，最后一句要等冲刷 | 已在 `drain_finals()` 中处理，停止采集时自动补写 |
+
+关于段错误的排查要点：这类崩溃发生在 C++ 扩展内部，**与文件是否被加密、与 DLP 无关**——用 `LoadFromSerializedProto(内存 bytes)` 同样崩，且模型文件本身是明文 protobuf。判定方法是把版本挨个换过去做矩阵测试，而不是盯着文件。
+
+完整环境搭建（Python 3.12）：
+
+```bash
+uv venv --python 3.12 .venv-sv
+uv pip install --python .venv-sv/Scripts/python.exe ^
+    "numpy==2.2.6" "onnxruntime==1.20.1" "sentencepiece==0.2.0" ^
+    cffi PyYAML jieba kaldi-native-fbank librosa scipy soundcard
+uv pip install --python .venv-sv/Scripts/python.exe --no-deps "funasr-onnx==0.4.3"
+
+.venv-sv/Scripts/python scripts/download_sensevoice.py   # 下载模型
+.venv-sv/Scripts/python scripts/probe_sensevoice.py      # 冒烟验证
+```
+
+用 3.12 环境启动整个程序即可同时拥有两个引擎（Vosk 走 ctypes 加载 DLL，在 3.12 上同样正常）：
+
+```bash
+.venv-sv/Scripts/python run.py
+```
 
 ### 降级提示策略
 
@@ -323,7 +385,7 @@ output/meeting_20261022_143015/
 
 ## 🧪 测试
 
-项目自带 8 组测试脚本，覆盖从识别到生命周期到后端回退的完整链路：
+项目自带 10 组测试脚本，覆盖从识别到生命周期到后端回退的完整链路：
 
 ```powershell
 python tests\smoke_test.py             # 识别 / 翻译 / 管线 冒烟
@@ -334,11 +396,13 @@ python tests\backend_fallback_test.py  # 翻译后端回退、熔断与模型降
 python tests\degrade_badge_test.py     # 降级提示去重 + UI 徽标端到端
 python tests\ui_test.py                # 字幕窗渲染与事件分发
 python tests\real_capture_test.py      # 真实放音 → 环录 → 识别端到端
+python tests\engine_switch_test.py     # 引擎切换：构建 / 切换 / 失败回滚 / 末句冲刷
+python tests\engine_ui_test.py         # 引擎下拉框：禁用态 / 成功回填 / 失败回滚
 ```
 
 `real_capture_test.py` 会真实占用音频设备，请先关闭正在运行的实例。
 
-`backend_fallback_test.py` 覆盖 21 项断言，其中降级提示相关的一组专门验证「只提示一次」：
+`backend_fallback_test.py` 覆盖 37 项断言，其中降级提示相关的一组专门验证「只提示一次」：
 
 | 用例 | 验证点 |
 |---|---|
@@ -358,6 +422,16 @@ python tests\real_capture_test.py      # 真实放音 → 环录 → 识别端�
 - 降级状态通过 `route` 事件与 `route_state` 暴露
 - UI 徽标实际显示 `⚠ 降级 primary/m-good`
 - 恢复首选路线后徽标自动清空
+
+`engine_switch_test.py` 与 `engine_ui_test.py` 覆盖引擎切换的三条路径：
+
+- **构建**：`build_asr()` 按名返回正确类型；未知引擎被拒绝且**实例不变**
+- **切换**：成功时替换实例并同步 `engine` / `cfg.asr.engine`；切回同样成立；重复切到当前引擎是幂等操作
+- **失败回滚**：采集中拒绝切换；依赖/模型缺失时保持原引擎并回滚下拉框
+- **末句冲刷**：SenseVoice 分段拼接结果与整段识别**逐字一致**，尾部不再丢失
+- **UI 一致性**：下拉框显示值与转写器实际引擎始终一致（成功回填、失败回滚）
+
+> 这两组测试在缺少 SenseVoice 运行条件（无 Python 3.12 环境 / 未下模型）时会自动跳过相关断言，不会误报失败。
 
 ---
 
@@ -396,16 +470,25 @@ model    = "qwen2.5:7b-instruct"
 
 ### 换用其他识别引擎
 
-`src/asr.py` 是唯一的识别耦合点，只要实现下列接口即可替换：
+识别引擎通过 `build_asr(cfg, engine)` 工厂统一构建（`src/transcriber.py`），新增引擎只需实现下列接口并在该工厂里加一个分支：
 
 ```python
 class ASREngine:
-    def __init__(self, model_dir: str): ...
-    def start(self) -> None: ...
-    def accept(self, pcm_bytes: bytes) -> str | None: ...  # 返回 partial 文本
-    def result(self) -> str: ...                          # 返回 final 文本
-    def stop(self) -> None: ...
+    def accept(self, pcm_bytes: bytes) -> str | None: ...
+        # 喂 16 kHz / 单声道 / 16-bit PCM；返回 None=尚未成句，返回 str=完整一句
+    def partial(self) -> str: ...
+        # 中间结果（块级引擎可恒返回 ""）
+    def drain_finals(self) -> list[str]: ...
+        # 流结束时冲刷残余的整句；不实现则最后一句会丢
+    def reset(self) -> None: ...
+    def close(self) -> None: ...
 ```
+
+内置两套实现：`src/asr.py`（Vosk，ctypes 直绑 `libvosk.dll`）与 `src/asr_sensevoice.py`（SenseVoice，funasr-onnx）。两者接口一致，因此 `src/transcriber.py` 及其下游管线完全无需改动。
+
+新增引擎后建议同步补一条 `tests/engine_switch_test.py` 风格的用例，验证构建、切换、失败回滚三条路径。
+
+> 注意 `drain_finals()`：解码器与 VAD 都要等到「确认没有后续语音」才会吐出最后一句。不实现它，会议的最后一句会在停止时丢失——这不是理论问题，本项目的 SenseVoice 引擎就踩过这个坑。
 
 可替换为 Whisper / faster-whisper / FunASR / 云端 ASR 等。
 
@@ -485,10 +568,44 @@ class ASREngine:
 
 | 报错 | 原因 | 解法 |
 |---|---|---|
-| `onnxruntime_pybind11_state: DLL 初始化例程失败`（WinError 1114） | cp314 的 onnxruntime（1.24.1+）与 Python 3.14 不兼容 | 换 Python 3.13 + `onnxruntime==1.20.1` |
+| `onnxruntime_pybind11_state: DLL 初始化例程失败`（WinError 1114） | cp314 的 onnxruntime（1.24.1+）与 Python 3.14 不兼容 | 换 Python 3.12/3.13 + `onnxruntime==1.20.1` |
 | `No module named numpy` | 用系统解释器 `--user` 安装，文件被 DLP 改名成 `.IPGSD` | 改用项目内 venv |
 
 核对命令：`python -c "import onnxruntime; print(onnxruntime.__version__)"` 能打印版本号才算装好。
+
+</details>
+
+<details>
+<summary><b>加载 SenseVoice 模型时段错误 <code>exit 139</code>？</b></summary>
+
+这是 `sentencepiece` 扩展崩溃，**与文件是否被加密、与 DLP 无关**。
+
+判断方法：崩在 `SentencePieceProcessor.Load()`，且用 `LoadFromSerializedProto(内存 bytes)`
+同样崩——内存数据不可能有加密问题，说明崩点在 pyd 内部。
+
+| 版本 | 本机表现 |
+|---|---|
+| `sentencepiece==0.2.1` / `0.2.2` | **一律段错误**（exit 139；faulthandler 栈显示崩在 `LoadFromFile`） |
+| `sentencepiece==0.2.0` | **正常**（cp312 Windows 轮子存在，vocab=25055） |
+
+解法：钉 `sentencepiece==0.2.0`，并用 Python 3.12 环境。
+
+> 既往记录里「0.2.0 无 Windows 轮子」的结论不成立——cp312 轮子是有的，
+> 只是此前一直在 3.13 / 3.14 上试，从未在 3.12 上验证过。
+
+排查这类崩溃的通用方法：把版本挨个换过去做矩阵测试，而不是盯着文件看。
+
+</details>
+
+<details>
+<summary><b>SenseVoice 识别结果只剩前半句，尾部丢失？</b></summary>
+
+VAD 只在检测到**后续静音**时才闭合分段，因此最后一句语音要等到流结束冲刷才会吐出。
+若引擎没有实现 `drain_finals()`（流结束时冲刷残余），会议的最后一句就会丢失。
+
+本项目已在 `SenseVoiceStream.drain_finals()` 与 `VoskASR.drain_finals()` 中实现，
+并在 `MeetingTranscriber.stop()` 时调用。验证方式见
+`tests/engine_switch_test.py` 的「末句冲刷」用例——分段拼接结果应与整段识别**逐字一致**。
 
 </details>
 

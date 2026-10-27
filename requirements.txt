@@ -3,24 +3,46 @@ numpy>=2.0
 cffi>=2.0
 soundcard>=0.4.6
 
+# ─────────────────────────────────────────────────────────────────────────
 # SenseVoice 引擎（可选，[asr] engine="sensevoice" 时需要）
 #
-# ★ 版本与 Python ABI 的硬约束（2026-10-27 实测）：
-#   onnxruntime==1.20.1 只发布到 cp313（Python 3.13），**无 cp314 轮子**；
-#   cp314 的 onnxruntime（1.24.1+）加载 pybind11 扩展会失败：
-#     ImportError: DLL load failed ... 动态链接库(DLL)初始化例程失败（WinError 1114）
-#   → 用 SenseVoice 引擎必须用 Python ≤ 3.13（推荐 3.13 + onnxruntime 1.20.1）。
-#   → Python 3.14 请保持 [asr] engine = "vosk"（只依赖 models/lib/libvosk.dll，无 ABI 约束）。
+# ★★ 版本与 Python ABI 的硬约束（2026-10-27 逐项实测，结论已固化）★★
 #
-# ★ funasr-onnx 声明 numpy<=1.26.4，但 numpy 1.26.4 无 cp313 轮子；
-#   实际安装用 numpy==2.2.6，并对 funasr-onnx 用 --no-deps 绕过该约束（运行时无兼容问题）。
+# 1) Python 必须 ≤ 3.13（推荐 3.12）
+#    onnxruntime==1.20.1 只发布到 cp313（Python 3.13），**无 cp314 轮子**；
+#    cp314 的 onnxruntime（1.24.1+）加载 pybind11 扩展会失败：
+#      ImportError: DLL load failed ... 动态链接库(DLL)初始化例程失败（WinError 1114）
+#    → 用 SenseVoice 引擎必须用 Python ≤ 3.13。
+#    → Python 3.14 请保持 [asr] engine = "vosk"（只依赖 models/lib/libvosk.dll，无 ABI 约束）。
 #
-#   .venv\Scripts\python -m pip install numpy==2.2.6 onnxruntime==1.20.1 \
-#       sentencepiece==0.2.1 cffi soundcard PyYAML jieba kaldi-native-fbank librosa scipy
-#   .venv\Scripts\python -m pip install --no-deps funasr-onnx==0.4.3
+# 2) sentencepiece **必须钉 0.2.0**
+#    ★ 这条与既往记录相反，特此更正 ★
+#    - 0.2.1 / 0.2.2：SentencePieceProcessor.Load() 一律 access violation
+#      （段错误，exit 139；faulthandler 栈显示崩在 LoadFromFile 内部）。
+#      与文件是否被加密、与 DLP 无关——用 LoadFromSerializedProto(内存 bytes)
+#      同样崩，且模型文件本身是明文 protobuf。→ 0.2.1/0.2.2 在本机不可用。
+#    - 0.2.0：加载正常（cp312 Windows 轮子存在，vocab=25055）。→ **可用**。
+#    （既往"0.2.0 无 Windows 轮子"的结论不成立：cp312 轮子是有的，
+#      只是此前一直在 3.13/3.14 上试，从未在 3.12 上验证过。）
+#
+# 3) funasr-onnx 声明 numpy<=1.26.4，但 numpy 1.26.4 无 cp313 轮子；
+#    实际安装用 numpy==2.2.6，并对 funasr-onnx 用 --no-deps 绕过该约束（运行时无兼容问题）。
+#
+# ── 安装命令（Python 3.12 环境）──────────────────────────────
+#   uv venv --python 3.12 .venv-sv
+#   uv pip install --python .venv-sv/Scripts/python.exe ^
+#       "numpy==2.2.6" "onnxruntime==1.20.1" "sentencepiece==0.2.0" ^
+#       cffi PyYAML jieba kaldi-native-fbank librosa scipy soundcard
+#   uv pip install --python .venv-sv/Scripts/python.exe --no-deps "funasr-onnx==0.4.3"
+#   .venv-sv\Scripts\python scripts\download_sensevoice.py   # 下载模型
+#   .venv-sv\Scripts\python scripts\probe_sensevoice.py      # 冒烟验证
+#
+#   注：librosa 会带入 scikit-learn/numba/threadpoolctl 等重依赖链，
+#   funasr_onnx 的 vad 模块用它做音频读取。
+# ─────────────────────────────────────────────────────────────────────────
 funasr-onnx==0.4.3
 onnxruntime==1.20.1        # 钉 1.20.1：≥1.21 的 pybind11 扩展在本机加载崩溃(0xC0000005)；1.18量化器有onnx兼容bug；无 cp314 轮子
-sentencepiece==0.2.1       # 0.2.2 加载崩溃；0.2.0 无 Windows 轮子
+sentencepiece==0.2.0       # ★ 钉 0.2.0：0.2.1/0.2.2 的 Load() 在本机一律段错误(exit 139)；0.2.0 正常
 modelscope                 # 模型下载用（scripts/download_sensevoice.py）
 
 # 说明：

@@ -5,6 +5,7 @@ import os
 import queue as queue_mod
 import tkinter as tk
 from pathlib import Path
+from tkinter import ttk
 
 from .transcriber import MeetingTranscriber
 
@@ -13,6 +14,12 @@ FG_ORIG = "#c9d1d9"
 FG_TRANS = "#f0f6fc"
 FG_PARTIAL = "#8b949e"
 FG_ACCENT = "#58a6ff"
+
+# 引擎展示信息：键=引擎名，值=(按钮文案, 菜单说明)
+ENGINES: dict[str, tuple[str, str]] = {
+    "vosk": ("Vosk", "流式逐词 · 轻量 · 无 ABI 约束"),
+    "sensevoice": ("SenseVoice", "块级整句 · 更准 · 停顿即断句"),
+}
 
 
 class SubtitleWindow:
@@ -24,6 +31,8 @@ class SubtitleWindow:
         self._anchors: dict[int, str] = {}
         self._cleared = 0
         self._started_once = False     # 是否已经开过一场（决定中央提示是否还显示）
+        # 引擎切换结果队列：后台线程投递，UI 主线程消费（tkinter 非线程安全）
+        self._engine_result: "queue_mod.Queue[tuple]" = queue_mod.Queue()
 
         self.root = tk.Tk()
         self.root.title("会议实时字幕")
@@ -64,6 +73,23 @@ class SubtitleWindow:
         self.degrade_lbl = tk.Label(bar, text="", fg="#d29922", bg=BG,
                                    font=("Microsoft YaHei", 9))
         self.degrade_lbl.pack(side="left", padx=2)
+        # 识别引擎切换：下拉菜单，常驻显示当前引擎。
+        # 采集中禁用（识别器正被采集线程调用，换掉会撕裂状态）。
+        # 注意：下拉框的值是**展示标签**（Vosk / SenseVoice），
+        # 与内部引擎名（vosk / sensevoice）一一映射，绝不能混用——
+        # 混用会让初值不在选项列表里，tkinter 下拉框会显示成空。
+        self.engine_var = tk.StringVar(
+            value=ENGINES.get(self.t.engine, (self.t.engine, ""))[0])
+        self.engine_btn = ttk.Combobox(
+            bar, textvariable=self.engine_var, state="readonly", width=13,
+            values=[ENGINES.get(e, (e, ""))[0] for e in ENGINES],
+            font=("Microsoft YaHei", 9))
+        self.engine_btn.pack(side="right", padx=4, pady=4)
+        self.engine_btn.bind("<<ComboboxSelected>>", self._on_engine_pick)
+        self._engine_name_by_label = {
+            ENGINES[e][0]: e for e in ENGINES
+        }
+        self._engine_label_by_name = {e: ENGINES[e][0] for e in ENGINES}
         self.btn = tk.Button(bar, text="▶ 开始", command=self._toggle, bg="#238636",
                              fg="#ffffff", relief="flat",
                              font=("Microsoft YaHei", 10), padx=14, cursor="hand2")
@@ -122,6 +148,55 @@ class SubtitleWindow:
         y = self.root.winfo_y() + e.y - self._drag["y"]
         self.root.geometry(f"+{x}+{y}")
 
+    def _on_engine_pick(self, _event=None) -> None:
+        """引擎下拉框选中 → 切换识别引擎。
+
+        SenseVoice 首次加载要读模型（数秒），必须放后台线程，否则窗口会假死。
+        切换成功后同步更新下拉框显示；失败则回滚到原引擎并把原因写入提示区。
+        """
+        label = self.engine_var.get()
+        engine = self._engine_name_by_label.get(label)
+        if engine is None or engine == self.t.engine:
+            return
+        if self.t.running:
+            self._append("采集中无法切换引擎，请先停止采集", "note")
+            self.engine_var.set(self._engine_label_by_name.get(self.t.engine, self.t.engine))
+            return
+        self.engine_btn.config(state="disabled")
+        self._append(f"正在切换到 {engine} 引擎…", "note")
+
+        def work() -> None:
+            ok, msg = self.t.switch_engine(engine)
+            # 结果经队列回主线程——**不能**在工作线程里直接调 root.after：
+            # tkinter 不是线程安全的，跨线程注册 after 会抛
+            # "main thread is not in main loop"，且在部分场景下直接崩进程。
+            self._engine_result.put((engine, ok, msg))
+
+        import threading as _threading
+
+        _threading.Thread(target=work, daemon=True).start()
+
+    def _engine_switch_done(self, engine: str, ok: bool, msg: str) -> None:
+        """引擎切换完成（已在 UI 主线程）。"""
+        try:
+            self.engine_btn.config(state="readonly")
+        except Exception:  # noqa: BLE001
+            pass
+        # 无论成功失败，下拉框都回填为**当前真实引擎**的展示标签，
+        # 绝不能让显示值与转写器实际状态不一致。
+        self.engine_var.set(self._engine_label_by_name.get(self.t.engine, self.t.engine))
+        if ok:
+            self._append(f"✓ {msg}", "note")
+        else:
+            self._append(f"✗ {msg}", "err")
+
+    def _set_engine_selectable(self, selectable: bool) -> None:
+        """采集中禁用引擎下拉框，停止后恢复。"""
+        try:
+            self.engine_btn.config(state="readonly" if selectable else "disabled")
+        except Exception:  # noqa: BLE001
+            pass
+
     def _toggle(self) -> None:
         """开始 / 停止 采集。
 
@@ -144,6 +219,8 @@ class SubtitleWindow:
 
     def _set_state(self, state: str) -> None:
         """统一刷新状态标签与按钮文案。"""
+        # 采集中禁止切换识别引擎
+        self._set_engine_selectable(state != "running")
         if state == "running":
             self.status.config(text="● 采集中", fg="#3fb950")
             self.btn.config(text="■ 停止", bg="#da3633")
@@ -357,7 +434,17 @@ class SubtitleWindow:
                         self._append(f"翻译后端未就绪：{msg}", "note")
         except queue_mod.Empty:
             pass
+        self._drain_engine_results()
         self.root.after(80, self._poll)
+
+    def _drain_engine_results(self) -> None:
+        """消费后台线程投递的引擎切换结果（UI 主线程执行）。"""
+        try:
+            while True:
+                engine, ok, msg = self._engine_result.get_nowait()
+                self._engine_switch_done(engine, ok, msg)
+        except queue_mod.Empty:
+            pass
 
     def run(self) -> None:
         self.root.mainloop()

@@ -98,6 +98,15 @@ class VoskASR:
         except Exception:
             return ""
 
+    def drain_finals(self) -> list[str]:
+        """流结束时冲刷残余，返回最后一句（无则空列表）。
+
+        与 SenseVoiceStream.drain_finals 同名同义：VAD/解码器都要等到
+        「确认没有后续语音」才会吐出最后一句，不冲刷就会丢掉会议最后一句。
+        """
+        text = self.final()
+        return [text] if text.strip() else []
+
     def reset(self) -> None:
         with self._lock:
             self._lib.vosk_recognizer_reset(self._rec)

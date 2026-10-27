@@ -31,28 +31,42 @@ from .capture import LoopbackCapture
 from .translate import Backend, Translator
 
 
+def build_asr(cfg, engine: str):
+    """按引擎名构建识别器。
+
+    抽成工厂是为了支持**运行时切换**：UI 的「切换引擎」按钮要在不重启
+    程序的前提下换掉识别器，两套引擎必须走同一条构建路径。
+
+    - "vosk"       → 流式逐词（libvosk.dll，无 Python ABI 约束）
+    - "sensevoice" → 块级整句（funasr-onnx，需 Python ≤ 3.13）
+    """
+    engine = (engine or "vosk").strip().lower()
+    if engine == "sensevoice":
+        # 懒导入：engine=vosk 时不背 onnx 依赖
+        from .asr_sensevoice import SenseVoiceStream
+
+        return SenseVoiceStream(
+            cfg.resolve(cfg.asr.sv_model_dir),
+            cfg.resolve(cfg.asr.sv_vad_dir),
+            sample_rate=cfg.audio.sample_rate,
+            threads=cfg.asr.sv_threads,
+            lang=cfg.asr.source_lang,
+            max_block_s=cfg.asr.sv_max_block_s,
+            textnorm=cfg.asr.sv_textnorm,
+        )
+    return VoskASR(
+        str(cfg.resolve(cfg.asr.lib_dir)),
+        str(cfg.resolve(cfg.asr.model_dir)),
+        cfg.audio.sample_rate,
+    )
+
+
 class MeetingTranscriber:
     def __init__(self, cfg, pcm_source: Optional[Callable] = None):
         self.cfg = cfg
         engine = str(getattr(cfg.asr, "engine", "vosk") or "vosk").lower()
-        if engine == "sensevoice":
-            # 懒导入：engine=vosk 时不背 onnx 依赖
-            from .asr_sensevoice import SenseVoiceStream
-            self.asr = SenseVoiceStream(
-                cfg.resolve(cfg.asr.sv_model_dir),
-                cfg.resolve(cfg.asr.sv_vad_dir),
-                sample_rate=cfg.audio.sample_rate,
-                threads=cfg.asr.sv_threads,
-                lang=cfg.asr.source_lang,
-                max_block_s=cfg.asr.sv_max_block_s,
-                textnorm=cfg.asr.sv_textnorm,
-            )
-        else:
-            self.asr = VoskASR(
-                str(cfg.resolve(cfg.asr.lib_dir)),
-                str(cfg.resolve(cfg.asr.model_dir)),
-                cfg.audio.sample_rate,
-            )
+        self.engine = engine
+        self.asr = build_asr(cfg, engine)
         self.translator = Translator(
             base_url=cfg.translate.base_url,
             api_key=cfg.translate.api_key,
@@ -123,6 +137,41 @@ class MeetingTranscriber:
     def _on_translator_status(self, ok: bool, reason: str) -> None:
         """翻译可用性变化 → 事件流（UI 更新徽标）。"""
         self.events.put(("trstatus", ok, reason))
+
+    # ---------------- 引擎切换 ----------------
+
+    def switch_engine(self, engine: str) -> tuple[bool, str]:
+        """运行时切换识别引擎。返回 (是否成功, 说明)。
+
+        约束：采集进行中不允许切换——识别器实例正被采集线程调用，
+        换掉会撕裂状态。UI 会在采集期间禁用该按钮，这里再兜一层。
+
+        切换失败（依赖缺失、模型缺失、ABI 不兼容等）时**保持原引擎不变**，
+        并把失败原因原样带回给 UI 提示，绝不留下半损坏状态。
+        """
+        engine = (engine or "").strip().lower()
+        if engine not in ("vosk", "sensevoice"):
+            return False, f"未知引擎：{engine}"
+        if self.running:
+            return False, "采集中无法切换引擎，请先停止"
+        if engine == self.engine:
+            return True, f"当前已是 {engine} 引擎"
+
+        try:
+            new_asr = build_asr(self.cfg, engine)
+        except Exception as e:  # noqa: BLE001
+            return False, f"切换到 {engine} 失败：{e}"
+
+        # 构建成功才替换；旧引擎此刻释放资源
+        old = self.asr
+        self.asr = new_asr
+        self.engine = engine
+        self.cfg.asr.engine = engine
+        try:
+            old.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return True, f"已切换到 {engine} 引擎"
 
     # ---------------- 会话生命周期 ----------------
     def _open_session(self) -> None:
@@ -315,6 +364,9 @@ class MeetingTranscriber:
         if self._started_at is None:
             self.events.put(("status", "stopped"))
             return
+        # 冲刷识别器残余：解码器/VAD 要等到「确认没有后续语音」才吐出最后一句，
+        # 不冲刷就会丢掉会议的最后一句（SenseVoice 尤其明显）。
+        self._flush_asr_tail()
         # 收尾：关闭 WAV、补写"结束时间/时长/句数"尾块
         self._close_session()
         self.events.put(("status", "stopped"))
@@ -329,6 +381,19 @@ class MeetingTranscriber:
             if wait_summary:
                 self._summary_thread.join(timeout=self.cfg.summary.timeout + 15)
                 self._summary_thread = None
+
+    def _flush_asr_tail(self) -> None:
+        """停止采集时冲刷识别器残余，把最后一句补进转写文档。"""
+        drain = getattr(self.asr, "drain_finals", None)
+        if drain is None:
+            return
+        try:
+            texts = drain() or []
+        except Exception:  # noqa: BLE001
+            return
+        for text in texts:
+            if text and text.strip():
+                self._on_final(text.strip())
 
     def _run_summary(self) -> None:
         try:
