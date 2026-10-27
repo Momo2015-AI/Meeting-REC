@@ -11,6 +11,8 @@
   8. 配置层：alt_backends 能从 TOML 解析出 base_url / 密钥文件
   9-13. 熔断自愈 / 预检假阳性 / 备用后端不拖累主后端
   14-16. 降级提示去重：多句只提示一次、恢复后可再提示、停用只提示一次
+  17-19. 限流（HTTP 429）专项：限流是临时状态，不得熔断/停用后端，
+         冷却到期自动放行自愈，全部后端限流也不得停用翻译
 """
 from __future__ import annotations
 
@@ -403,8 +405,128 @@ def main() -> int:
           len(statuses16) == 1 and statuses16[0][0] is False,
           f"statuses={statuses16}")
 
+    # ---------- 场景 17：限流（HTTP 429）是临时状态，不得打掉备用后端 ----------
+    # 真实事故：备用后端 agnes 未实名认证 → 账号级 1 req/min 限流。
+    # 旧实现把 429 当硬失败 → 熔断 + 累计到阈值 → 翻译被永久停用，
+    # 整场会议再也译不出来。修复后：429 只进冷却，不熔断、不停用。
+    class _H17(_Handler):
+        state = {"limited": True}
+        calls = {"primary": 0, "alt": 0}
+
+        def do_POST(self):  # noqa: N802
+            body = self._read_body()
+            model = body.get("model", "")
+            if model == "m-a":
+                _H17.calls["primary"] += 1
+                if _H17.state["limited"]:
+                    self._send(429, {"error": {"message": "Too Many Requests"}})
+                else:
+                    self._send(200, {"choices": [{"message": {"content": "主后端译文"}}]})
+            else:
+                _H17.calls["alt"] += 1
+                self._send(200, {"choices": [{"message": {"content": "备用译文"}}]})
+
+    srv17 = HTTPServer(("127.0.0.1", 0), _H17)
+    threading.Thread(target=srv17.serve_forever, daemon=True).start()
+    url17 = f"http://127.0.0.1:{srv17.server_address[1]}/v1"
+    tr17 = Translator(base_url=url17, api_key="k", model="m-a",
+                      translate_models=["m-a", "m-a2"],
+                      alt_backends=[Backend(name="alt", base_url=url17, api_key="k2",
+                                            model="m-alt")])
+    tr17.enabled = True
+    notes17: list[str] = []
+    statuses17: list[tuple] = []
+    tr17.events_sink = notes17.append
+    tr17.status_sink = lambda ok, reason: statuses17.append((ok, reason))
+    outs17 = [tr17.translate("hello", "en") for _ in range(5)]
+    check("场景17a 限流时自动降级到备用后端并继续出译文",
+          all(o == "备用译文" for o in outs17), f"译文={outs17[:3]}")
+    check("场景17b 限流不熔断主后端（未进入 breaker 状态）",
+          tr17._breaker.get("primary", 0) == 0,
+          f"breaker={tr17._breaker}")
+    check("场景17c 限流不累计停用计数（翻译未被停用）",
+          tr17.enabled is True and tr17._fail == 0,
+          f"enabled={tr17.enabled} fail={tr17._fail}")
+    check("场景17d 限流不触发停用回调",
+          len(statuses17) == 0, f"statuses={statuses17}")
+    check("场景17e 限流提示只出现一次（不逐句刷屏）",
+          len([n for n in notes17 if "限流" in n]) == 1,
+          f"限流提示={len([n for n in notes17 if '限流' in n])} notes={notes17}")
+    check("场景17f 限流后同后端不再重复调用（省一次往返）",
+          _H17.calls["primary"] == 1,
+          f"primary调用={_H17.calls['primary']}")
+
+    # ---------- 场景 18：限流冷却到期自动放行，配额恢复即自愈 ----------
+    tr18 = Translator(base_url=url17, api_key="k", model="m-a",
+                      translate_models=["m-a"],
+                      alt_backends=[Backend(name="alt", base_url=url17, api_key="k2",
+                                            model="m-alt")])
+    tr18.enabled = True
+    notes18: list[str] = []
+    tr18.events_sink = notes18.append
+    tr18.translate("hello", "en")          # 触发限流 → 进入冷却
+    check("场景18a 限流后进入冷却状态",
+          tr18._in_rate_limit("primary") is True,
+          f"rate_limit_until={tr18._rate_limit_until}")
+    import time as _time
+    # 模拟冷却期自然到期（把冷却截止时间拨到过去）
+    tr18._rate_limit_until["primary"] = _time.monotonic() - 1.0
+    _H17.state["limited"] = False          # 配额窗口重开
+    out18 = tr18.translate("hello again", "en")
+    check("场景18b 冷却到期自动放行，配额恢复后主后端回归",
+          out18 == "主后端译文",
+          f"译文={out18!r} 限流记录={tr18._rate_limit_until}")
+    check("场景18c 恢复后清掉限流记录（下次可重新提示）",
+          "primary" not in tr18._rate_limit_until,
+          f"rate_limit_until={tr18._rate_limit_until}")
+
+    # ---------- 场景 19：全部后端限流 → 不得停用翻译 ----------
+    class _H19(_Handler):
+        def do_POST(self):  # noqa: N802
+            self._read_body()
+            self._send(429, {"error": {"message": "Too Many Requests"}})
+
+    srv19 = HTTPServer(("127.0.0.1", 0), _H19)
+    threading.Thread(target=srv19.serve_forever, daemon=True).start()
+    url19 = f"http://127.0.0.1:{srv19.server_address[1]}/v1"
+    tr19 = Translator(base_url=url19, api_key="k", model="m-a",
+                      translate_models=["m-a"])
+    tr19.enabled = True
+    notes19: list[str] = []
+    statuses19: list[tuple] = []
+    tr19.events_sink = notes19.append
+    tr19.status_sink = lambda ok, reason: statuses19.append((ok, reason))
+    for _ in range(8):
+        tr19.translate("hello", "en")
+    check("场景19a 全部后端限流时翻译不被停用",
+          tr19.enabled is True, f"enabled={tr19.enabled}")
+    check("场景19b 全部后端限流不触发停用回调",
+          len(statuses19) == 0, f"statuses={statuses19}")
+    check("场景19c 全部后端限流提示只出现一次",
+          len([n for n in notes19 if "限流" in n]) == 1,
+          f"限流提示={len([n for n in notes19 if '限流' in n])}")
+
+    # ---------- 场景 20：HTTP 429 的两种含义必须区分 ----------
+    # 同一个状态码，可能是"发得太快"（临时，等窗口重开即恢复），
+    # 也可能是"额度用尽"（需人工充值，等窗口重开无效）。
+    # 把额度耗尽误判为限流会导致对着一个已停用的模型无限重试。
+    check("场景20a 429 + rpm 提示 → 判为限流（临时）",
+          Translator._is_rate_limit("agnes-2.5-flash HTTP 429：请登录platform进行实名认证以获取更高rpm"),
+          "应判为限流")
+    check("场景20b 429 + SetLimitExceeded → 判为额度耗尽（硬失败）",
+          not Translator._is_rate_limit(
+              "deepseek HTTP 429：SetLimitExceeded: Your account has reached the "
+              "set usage limit, and the model service has been paused"),
+          "不应判为限流")
+    check("场景20c 403 额度不足 → 不判为限流",
+          not Translator._is_rate_limit("m-a HTTP 403：quota：额度不足"),
+          "403 额度不足不应判为限流")
+    check("场景20d 429 + 通用 rate limit → 判为限流",
+          Translator._is_rate_limit("m-a HTTP 429：rate limit exceeded"),
+          "应判为限流")
+
     for srv in (srv, srv2, srv3, srv5, srv6, srv9, srv10, srv11, srv12, srv13,
-                srv14, srv15):
+                srv14, srv15, srv17, srv19):
         srv.shutdown()
 
     n_ok = sum(1 for r in results if r[0] == PASS)

@@ -24,6 +24,45 @@ _LANG_NAME = {"zh": "中文", "en": "英文"}
 # "1. 译文" / "12、译文" / "3：译文" 等编号行
 _NUM_LINE_RE = re.compile(r"^\s*(\d{1,2})\s*[.、．:：)）\]]\s*(.+)$")
 
+# 限流（HTTP 429）特征。
+# 限流与"额度耗尽 / 模型不可用"性质不同：它是"发得太快"的**临时**状态，
+# 等一会儿配额窗口就会重开。因此限流既不该计入后端熔断计数（否则一次
+# 抖动就把后端长期拉黑），也不该计入"停用翻译"的失败计数（否则一场
+# 会议就永久失去翻译了）。
+#
+# 但 HTTP 429 并不都是限流——同一个状态码可能表示"额度已用尽"，
+# 那种情况需要人工充值/提额，等窗口重开并不会恢复，必须区分开：
+#   · Agnes    ：请登录platform进行实名认证以获取更高rpm        → RPM 限流（临时）
+#   · 火山方舟 ：SetLimitExceeded / usage limit / 额度用尽       → 额度耗尽（需人工处理）
+#
+# 状态码由本项目的错误格式化统一写成 "HTTP 429：..."，因此以它为准。
+_RATE_LIMIT_PATTERNS = (
+    "http 429",
+    "too many requests",
+    "rate limit",
+    "ratelimit",
+    "请求过于频繁",
+    "触发限流",
+    "达到频率上限",
+    "获取更高rpm",
+    "每分钟",
+)
+
+# 额度耗尽特征：命中这些说明"等窗口重开"没用，必须当成硬失败处理，
+# 否则会对着一个已停用的模型无限重试，白白拖慢每一句翻译。
+_QUOTA_EXHAUSTED_PATTERNS = (
+    "setlimitexceeded",
+    "usage limit",
+    "quota",
+    "额度不足",
+    "额度耗尽",
+    "余额不足",
+    "insufficient",
+    "billing",
+    "account.*paused",
+    "模型服务已暂停",
+)
+
 
 class SummaryError(RuntimeError):
     """总结请求失败（携带后端返回的可读原因，如"额度不足"）。"""
@@ -89,6 +128,18 @@ class Translator:
         # 主后端熔断后的自愈探测间隔（秒）
         self._recover_interval = 60.0
         self._last_probe: Optional[float] = None
+        # ---------------- 限流（HTTP 429）冷却 ----------------
+        # 限流是"发得太快"的临时状态，配额窗口重开即可恢复。它与"额度耗尽"
+        # 必须区别对待：
+        #   - 限流**不**计入 _fail / _backend_fail，因此不会把后端熔断、
+        #     也不会累计到阈值把整个翻译永久停用；
+        #   - 限流后该后端进入冷却（默认 60s），冷却期内直接跳过，
+        #     避免每一句都去撞一次 429 白等一个往返；
+        #   - 冷却期结束后自动放行重试，配额恢复即自愈。
+        self._rate_limit_until: dict[str, float] = {}
+        self._rate_limit_cooldown = 60.0
+        # 限流提示同样只发一次（key 前缀 rate_limit:）
+        self._rate_limited: set[str] = set()
 
         # ---------------- 提示去重 ----------------
         # 降级/失败提示改为「状态变化事件」：同一类问题每场只提示一次，
@@ -288,6 +339,20 @@ class Translator:
                                              timeout=timeout, backend=be)
                 except SummaryError as e:
                     last_err = e
+                    # ---- 限流：临时状态，换后端而不是换模型 ----
+                    if self._is_rate_limit(str(e)):
+                        self._enter_rate_limit(be.name, str(e))
+                        nxt_be = self._next_backend(backends, be)
+                        if nxt_be:
+                            self._note(f"summary_rate_limit:{be.name}",
+                                       f"{be.name} 总结触发限流（{e}），"
+                                       f"切换到 {nxt_be.name} 后端")
+                        else:
+                            self._note(f"summary_rate_limit:{be.name}",
+                                       f"{be.name} 总结触发限流（{e}），"
+                                       f"已暂停 {int(self._rate_limit_cooldown)} 秒后重试")
+                        # 限流通常是账号级配额，换模型无意义 → 直接换后端
+                        break
                     nxt = chain[idx + 1] if idx + 1 < len(chain) else None
                     if nxt:
                         # 同一模型上的失败只提示一次
@@ -406,9 +471,11 @@ class Translator:
                 body = e.read().decode("utf-8", "replace")[:400]
             except Exception:  # noqa: BLE001
                 pass
-            self._fail += 1
-            raise SummaryError(
-                f"HTTP {e.code}：{self._extract_api_msg(body) or e.reason}") from e
+            msg = f"HTTP {e.code}：{self._extract_api_msg(body) or e.reason}"
+            # 限流是临时状态，不计入停用计数（见 _is_rate_limit 的说明）
+            if not self._is_rate_limit(msg):
+                self._fail += 1
+            raise SummaryError(msg) from e
         except Exception as e:  # noqa: BLE001
             self._fail += 1
             raise SummaryError(f"{e.__class__.__name__}：{e}") from e
@@ -516,13 +583,27 @@ class Translator:
         # 主后端熔断后，定期放行一次让它自愈（额度恢复后自动切回）
         self._maybe_recover_primary()
         any_ok = False
+        # 本轮所有失败是否都只是"限流"这一种临时原因。
+        # 若是，则不计入停用计数（限流等配额窗口重开即恢复，不该把翻译永久停用）
+        only_rate_limit = True
+        # 本轮是否真的发起过请求。全部后端都被跳过（熔断/限流冷却）时，
+        # 本轮没有新的错误信息，不应据此判定任何停用动作。
+        made_request = False
         for be in backends:
             # 熔断：该后端刚连续失败过，先跳过（避免每批都白等一个超时）
+            # 熔断跳过是**中性**的：硬失败在触发熔断时已计入计数，
+            # 这里重复计会让"只剩限流后端"的情况被误判为硬故障而停用翻译。
             if self._is_open(be.name):
+                continue
+            # 限流冷却：该后端刚被 429 限流，冷却期内直接跳过
+            # （限流是临时状态，配额窗口重开即自动放行，不做硬熔断）
+            if self._in_rate_limit(be.name):
+                last_err = last_err or f"{be.name} 后端限流中，稍后重试"
                 continue
             chain = be.translate_models or [be.model]
             for idx, m in enumerate(chain):
                 out, err = self._translate_once(texts, src_name, tgt_name, m, be, ctxs)
+                made_request = True
                 if out:
                     any_ok = True
                     self._fail = 0
@@ -530,10 +611,31 @@ class Translator:
                     # 其他后端的失败计数保持不变（否则主后端熔断会被误清）
                     self._reset_breaker(be.name)
                     self._backend_fail[be.name] = 0
+                    # 该后端已恢复可用 → 清掉它的限流记录，下次再限流可以重新提示
+                    self._rate_limit_until.pop(be.name, None)
+                    self._clear_notes(f"rate_limit:{be.name}")
                     # 记录生效路线：变化时才提示一次，同路线持续工作完全静默
                     self._set_route(be.name, m)
                     return out
                 last_err = err
+                # ---- 限流（HTTP 429）：临时状态，特殊处理 ----
+                if self._is_rate_limit(err):
+                    self._enter_rate_limit(be.name, err)
+                    nxt_be = self._next_backend(backends, be)
+                    if nxt_be:
+                        self._note(f"rate_limit:{be.name}",
+                                   f"{be.name} 后端触发限流（{err}），"
+                                   f"已暂停 {int(self._rate_limit_cooldown)} 秒，"
+                                   f"切换到 {nxt_be.name} 后端")
+                    else:
+                        self._note(f"rate_limit:{be.name}",
+                                   f"{be.name} 后端触发限流（{err}），"
+                                   f"已暂停 {int(self._rate_limit_cooldown)} 秒后重试")
+                    # 同一后端换模型无意义：限流通常是**账号级**配额
+                    # （实测：agnes 三个模型共享同一 1 req/min 配额），
+                    # 继续试下一个模型只会多烧请求、多刷提示。
+                    break
+                only_rate_limit = False
                 # 失败按后端独立累计，不污染全局计数
                 self._backend_fail[be.name] = self._backend_fail.get(be.name, 0) + 1
                 self._trip_breaker(be.name)
@@ -552,6 +654,13 @@ class Translator:
 
         if any_ok:
             # 本批至少有一个后端成功过 → 不累计全局失败
+            return ["" for _ in texts]
+
+        if only_rate_limit or not made_request:
+            # 本轮失败全部来自限流（临时状态，配额窗口重开即可恢复），
+            # 或本轮所有后端都被跳过（熔断/限流冷却，没有新错误信息）。
+            # 这两种情况都**不能**把翻译永久停用 —— 否则一场会议就再也译不出来。
+            self.last_error = last_err or self.last_error
             return ["" for _ in texts]
 
         # 所有后端都失败：连续失败达阈值才停用（避免单次抖动误伤）
@@ -574,6 +683,47 @@ class Translator:
     def _trip_breaker(self, name: str) -> None:
         """记录某后端的一次失败。"""
         self._breaker[name] = self._breaker.get(name, 0) + 1
+
+    @staticmethod
+    def _is_rate_limit(err: str) -> bool:
+        """判断错误是否为限流（HTTP 429 / Too Many Requests）。
+
+        限流是"发得太快"的临时状态，与额度耗尽（403）、模型不可用（404）
+        性质完全不同：前者等配额窗口重开就恢复，后者不会自己好。
+        两者若混为一谈，一次限流就会把后端熔断掉甚至永久停用翻译。
+
+        注意 HTTP 429 也可能表示"额度用尽"（火山方舟 SetLimitExceeded、
+        Agnes 实名认证前的 rpm 限制等），必须先排除额度耗尽再判限流。
+        """
+        if not err:
+            return False
+        low = err.lower()
+        # 额度耗尽优先：等配额窗口重开对它无效，必须当硬失败处理
+        if any(p in low for p in _QUOTA_EXHAUSTED_PATTERNS):
+            return False
+        return any(p in low for p in _RATE_LIMIT_PATTERNS)
+
+    def _enter_rate_limit(self, name: str, err: str) -> None:
+        """标记后端进入限流冷却。
+
+        冷却期内该后端被直接跳过，避免每句都去撞一次 429 白等一个往返；
+        冷却结束后自动放行，配额恢复即自愈。
+        """
+        self._rate_limit_until[name] = time.monotonic() + self._rate_limit_cooldown
+        self._rate_limited.add(name)
+
+    def _in_rate_limit(self, name: str) -> bool:
+        """该后端是否仍处于限流冷却期。冷却到期自动放行。"""
+        until = self._rate_limit_until.get(name)
+        if until is None:
+            return False
+        if time.monotonic() < until:
+            return True
+        # 冷却期已过 → 放行，并清掉限流记录（下次再限流可以重新提示）
+        self._rate_limit_until.pop(name, None)
+        self._rate_limited.discard(name)
+        self._clear_notes(f"rate_limit:{name}")
+        return False
 
     def _reset_breaker(self, name: str) -> None:
         """该后端成功一次 → 清空失败计数。"""

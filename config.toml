@@ -65,6 +65,15 @@ system_prompt = "你是专业的会议同声传译。译文准确、术语统一
 # ---- 备用后端：主后端额度耗尽/限流时自动切到这里，会议不中断 ----
 # 多个服务商可并列配置，[[translate.alt_backends]] 可重复出现。
 # api_key_file 指向的密钥文件同样不进入版本库。
+#
+# 关于限流：程序会自动区分 HTTP 429 的两种含义——
+#   · "获取更高 rpm / too many requests" → 临时限流，该后端进 60s 冷却，
+#     自动放行重试，不熔断也不停用翻译；
+#   · "额度不足 / SetLimitExceeded"     → 额度耗尽（需人工充值），
+#     按硬失败处理，自动切到下一个后端。
+# 因此备用后端的 fallback_models 里不必堆同账号的多个模型：
+# 若配额是账号级的（如 Agnes 未实名认证时 1 req/min，三个模型共享同一份额度），
+# 换模型无效，只会多烧请求。
 [[translate.alt_backends]]
 name = "alt-1"
 enabled = true
