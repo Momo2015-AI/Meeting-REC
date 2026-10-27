@@ -17,7 +17,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 _LANG_NAME = {"zh": "中文", "en": "英文"}
 
@@ -86,11 +86,24 @@ class Translator:
         # 后端熔断：某后端连续失败到阈值后暂时跳过，不让每句都白等一个超时
         self._breaker: dict[str, int] = {}
         self._breaker_threshold = 2
-        # 记录最近一次"切换到哪个备用后端"，避免同一降级逐句重复提示
-        self._last_switch_note = ""
         # 主后端熔断后的自愈探测间隔（秒）
         self._recover_interval = 60.0
         self._last_probe: Optional[float] = None
+
+        # ---------------- 提示去重 ----------------
+        # 降级/失败提示改为「状态变化事件」：同一类问题每场只提示一次，
+        # 而不是每句翻译都弹一条（主模型挂掉时那会刷屏到无法阅读）。
+        # key 格式统一为 "<kind>:<backend>:<model>"，便于按后端批量清理。
+        self._noted: set[str] = set()
+        # 当前生效路线 (后端, 模型)；变化时才提示并刷新状态
+        self._route: Optional[tuple[str, str]] = None
+        # 对外暴露的路线状态：(是否降级, 后端名, 模型名)，供 UI 徽标显示
+        self.route_state: Optional[tuple[bool, str, str]] = None
+        # 路线变化回调 (degraded, backend, model)：由 transcriber 接到事件流，
+        # 让 UI 用「常驻徽标」表达当前降级状态，而不是靠反复弹提示。
+        self.route_sink: Optional[Callable[[bool, str, str], None]] = None
+        # 翻译可用性变化回调 (可用?, 原因)：停用/恢复时更新 UI 徽标
+        self.status_sink: Optional[Callable[[bool, str], None]] = None
 
     # ---------------- 后端清单 ----------------
     def _backend_chain(self) -> list[Backend]:
@@ -277,12 +290,15 @@ class Translator:
                     last_err = e
                     nxt = chain[idx + 1] if idx + 1 < len(chain) else None
                     if nxt:
-                        self.events_sink(f"总结模型 {m} 失败（{e}），降级到 {nxt}")
+                        # 同一模型上的失败只提示一次
+                        self._note(f"summary_model_fail:{be.name}:{m}",
+                                   f"总结模型 {m} 失败（{e}），降级到 {nxt}")
                         continue
                     # 本后端模型链走完 → 换下一个后端（跨服务商兜底）
                     nxt_be = self._next_backend(backends, be)
                     if nxt_be:
-                        self.events_sink(f"总结模型 {m} 失败（{e}），切换到 {nxt_be.name} 后端")
+                        self._note(f"summary_backend_fail:{be.name}:{m}",
+                                   f"总结模型 {m} 失败（{e}），切换到 {nxt_be.name} 后端")
                         break
                     raise
                 if out.strip():
@@ -296,6 +312,64 @@ class Translator:
     def events_sink(self, msg: str) -> None:
         """回退过程中的提示。由调用方（transcriber）接到事件流。"""
         self._pending_note = msg
+
+    # ---------------- 提示去重 / 路线状态 ----------------
+
+    def _note(self, key: str, msg: str) -> None:
+        """发出一条提示，但同一 key 只发一次。
+
+        key 形如 "<kind>:<backend>:<model>"，同一类降级在同一后端/模型上
+        只提示一次——避免主模型挂掉后每句都刷一条同样的提示。
+        """
+        if key in self._noted:
+            return
+        self._noted.add(key)
+        self.events_sink(msg)
+
+    def _clear_notes(self, prefix: str) -> None:
+        """清除某一类提示的去重记录（状态恢复后允许再次提示）。"""
+        for k in [k for k in self._noted if k.startswith(prefix)]:
+            self._noted.discard(k)
+
+    def _preferred_model(self, backend: str) -> str:
+        """该后端的首选模型（回退链的第一档）。"""
+        if backend == "primary":
+            chain = self.translate_models or [self.model]
+        else:
+            for b in self.alt_backends:
+                if b.name == backend:
+                    chain = b.translate_models or [b.model]
+                    break
+            else:
+                return ""
+        return chain[0] if chain else ""
+
+    def _set_route(self, backend: str, model: str) -> None:
+        """记录当前实际生效的（后端, 模型）路线。
+
+        路线变化时才更新状态；**降级时不发提示**（失败原因已由 _note 报过，
+        避免同一次降级弹出两行），只有恢复到首选路线时才提示一次。
+        """
+        route = (backend, model)
+        if route == self._route:
+            return
+        first = self._route is None
+        self._route = route
+        degraded = (backend != "primary") or (model != self._preferred_model(backend))
+        self.route_state = (degraded, backend, model)
+        # 徽标状态始终同步（含首次建立路线），否则 UI 拿不到降级信息
+        if self.route_sink is not None:
+            self.route_sink(degraded, backend, model)
+        if first:
+            # 会话刚开始的正常状态，不提示
+            return
+        if not degraded:
+            # 恢复到首选：清掉该后端的旧降级提示记录，
+            # 将来若再次降级可以重新提示一次
+            self._clear_notes(f"model_fail:{backend}:")
+            self._clear_notes(f"backend_fail:{backend}:")
+            self._clear_notes("primary_probe:")
+            self.events_sink(f"翻译已恢复到 {backend} 后端（{model}）")
 
     def _summary_once(self, transcript: str, system_prompt: str, model: str,
                       timeout: Optional[float] = None,
@@ -456,13 +530,8 @@ class Translator:
                     # 其他后端的失败计数保持不变（否则主后端熔断会被误清）
                     self._reset_breaker(be.name)
                     self._backend_fail[be.name] = 0
-                    if be.name != "primary":
-                        # 同一次降级只提示一次，不逐句刷屏
-                        if self._last_switch_note != be.name:
-                            self.events_sink(f"翻译已切换到 {be.name} 后端（{m}）")
-                            self._last_switch_note = be.name
-                    elif m != self.model:
-                        self.events_sink(f"翻译模型降级到 {m}")
+                    # 记录生效路线：变化时才提示一次，同路线持续工作完全静默
+                    self._set_route(be.name, m)
                     return out
                 last_err = err
                 # 失败按后端独立累计，不污染全局计数
@@ -470,12 +539,14 @@ class Translator:
                 self._trip_breaker(be.name)
                 nxt = chain[idx + 1] if idx + 1 < len(chain) else None
                 if nxt:
-                    self.events_sink(f"翻译模型 {m} 失败（{last_err}），降级到 {nxt}")
+                    # 同一模型上的失败只提示一次，不逐句刷屏
+                    self._note(f"model_fail:{be.name}:{m}",
+                               f"翻译模型 {m} 失败（{last_err}），降级到 {nxt}")
                     continue
                 nxt_be = self._next_backend(backends, be)
                 if nxt_be:
-                    self.events_sink(
-                        f"翻译模型 {m} 失败（{last_err}），切换到 {nxt_be.name} 后端")
+                    self._note(f"backend_fail:{be.name}:{m}",
+                               f"翻译模型 {m} 失败（{last_err}），切换到 {nxt_be.name} 后端")
                     break
                 break
 
@@ -487,8 +558,16 @@ class Translator:
         self._fail += 1
         if self._fail >= self._max_fail:
             self.enabled = False
-            self.disabled_reason = last_err
-        self.last_error = last_err
+            # 全部后端都在熔断期被跳过时，本轮没有新的错误信息，
+            # 沿用上一次的真实失败原因（否则提示会是空的，看不出问题）
+            reason = last_err or self.last_error or "所有后端均不可用"
+            self.disabled_reason = reason
+            # 停用只提示一次（后续每句失败不再重复打扰）
+            self._note("translate_disabled:all",
+                       f"翻译已停用（连续 {self._fail} 次失败）：{reason}")
+            if self.status_sink is not None:
+                self.status_sink(False, reason)
+        self.last_error = last_err or self.last_error
         return ["" for _ in texts]
 
     # ---------------- 后端熔断 ----------------
@@ -520,7 +599,9 @@ class Translator:
         # 放行窗口：把计数压到阈值-1，让本次请求能真正打到主后端；
         # 若这次仍失败，_trip_breaker 会把它重新推回阈值。
         self._breaker["primary"] = self._breaker_threshold - 1
-        self.events_sink("正在重试主后端…")
+        # 探测提示同样只发一次，避免自愈探测每分钟刷一条
+        self._note("primary_probe:primary",
+                   f"主后端已熔断，正在重试（每 {int(self._recover_interval)}s 放行一次）…")
     def _translate_once(self, texts: list[str], src_name: str, tgt_name: str,
                         model: str, be: Optional[Backend],
                         ctxs: Optional[list[list[str]]] = None

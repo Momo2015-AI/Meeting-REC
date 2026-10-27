@@ -35,7 +35,16 @@ Meeting-REC 是一个**完全跑在你自己电脑上**的会议记录工具。
 > SenseVoice-Small（阿里达摩院 FunASR）——识别准确率显著更高、自带标点，
 > 切句由流式 Fsmn-VAD 完成（停顿即断句、超长自动强制断句），连续语速下翻译提早数秒。
 > 模型下载：`python scripts/download_sensevoice.py`（ModelScope 国内直连 ≈ 940 MB）。
-> onnxruntime 建议钉 1.20.1：更新的版本在该机器环境存在 pybind11 扩展加载兼容问题（AV 0xC0000005）。
+
+> **onnxruntime 版本与 Python ABI 的硬约束**（2026-10-27 实测）：
+> `onnxruntime==1.20.1` 只发布到 **cp313**（Python 3.13），**没有 cp314（Python 3.14）轮子**；
+> 而 cp314 的 onnxruntime（1.24.1 起）在本机加载 pybind11 扩展会失败：
+> `ImportError: DLL load failed ... 动态链接库(DLL)初始化例程失败`（WinError 1114）。
+> **结论：要用 SenseVoice 引擎，解释器必须用 Python ≤ 3.13**（推荐 3.13 + `onnxruntime==1.20.1`）。
+> 用 Python 3.14 请把 `[asr] engine` 保持为 `"vosk"`（仅依赖 `models/lib/libvosk.dll`，无 ABI 约束）。
+>
+> 另注：`funasr-onnx` 声明 `numpy<=1.26.4`，但 numpy 1.26.4 无 cp313 轮子，
+> 实际需装 `numpy==2.2.6` 并用 `--no-deps` 绕过该约束（运行时无兼容问题）。
 
 ---
 
@@ -48,6 +57,7 @@ Meeting-REC 是一个**完全跑在你自己电脑上**的会议记录工具。
 | **实时翻译** | 任意 OpenAI 兼容 `/chat/completions` 端点，独立工作线程，翻译卡顿不阻塞识别 |
 | **多后端回退** | 主后端连续失败自动熔断，切换备用服务商；60 秒后自动探测恢复 |
 | **模型回退链** | 同一后端内多个模型按顺序降级，抵御单模型限流 |
+| **降级只提示一次** | 同一降级原因全场只提示一次，不逐句刷屏；当前降级路线用常驻徽标表达 |
 | **双语字幕窗** | tkinter 置顶窗，原文/译文成对显示，可拖动、可调透明度 |
 | **手动开始** | 默认不自动采集，点击「开始」后才监听系统音频 |
 | **实时落盘** | 每一句原文与译文实时写入 Markdown，中途崩溃也不丢内容 |
@@ -108,6 +118,7 @@ Meeting-REC 是一个**完全跑在你自己电脑上**的会议记录工具。
 | **设备热拔插重连** | 耳机拔插/默认设备切换导致环录中断后，自动重连新输出设备，录音无缝续写 |
 | **whisper 离线重识别** | 一键用 whisper.cpp 重转写本场 WAV，修正 Vosk small 模型的识别误差 |
 | **单实例拉起** | 重复启动 `run.py` 不会开第二个窗口，自动把已有字幕窗调至前台 |
+| **降级提示去重** | 提示按「语义签名」去重——同一模型/后端的同类失败只播报一次；降级状态改由常驻徽标承载，避免主模型挂掉时提示刷屏淹没字幕 |
 
 ---
 
@@ -213,7 +224,23 @@ python launch.py --detach        # 以独立进程挂机运行
 | **拖动标题栏** | 移动字幕窗位置 |
 | **`Esc`** | 退出应用（退出时自动收尾，纪要不丢） |
 
-顶部状态栏从左到右：采集状态（● 待开始 / 采集中 / 总结中 / 已停止）→ 语种方向 → 翻译后端徽标（翻译已就绪 / 仅转写）。
+顶部状态栏从左到右：采集状态（● 待开始 / 采集中 / 总结中 / 已停止）→ 语种方向 → 翻译后端徽标（翻译已就绪 / 仅转写）→ 降级徽标。
+
+### 降级提示策略
+
+主模型额度耗尽、渠道限流、服务商抖动时，翻译层会自动降级。**降级过程只提示一次，不会逐句刷屏**：
+
+| 场景 | 表现 |
+|---|---|
+| 首选模型失败 | 提示一次「翻译模型 X 失败（原因），降级到 Y」，之后同路线持续工作完全静默 |
+| 整条后端失败 | 提示一次「翻译模型 X 失败（原因），切换到 Z 后端」，不再重复 |
+| 主后端熔断 | 提示一次「主后端已熔断，正在重试（每 60s 放行一次）…」 |
+| 翻译整体停用 | 提示一次「翻译已停用（连续 N 次失败）：原因」，徽标转为「仅转写」 |
+| 恢复首选路线 | 提示一次「翻译已恢复到 primary 后端（模型名）」，并清除该路线的去重记录，将来再次降级可重新提示 |
+
+**降级状态本身由常驻徽标承载**（字幕窗顶部 `⚠ 降级 后端/模型`），而不是靠反复弹提示。控制台模式下对应打印 `[route] 降级：primary/模型名`。
+
+实现要点：提示去重采用「语义签名」key（`<kind>:<backend>:<model>`），失败原因走一次性提示（`_note()`），路线状态走状态变更回调（`_set_route()` → `route_state` / `route_sink`）。UI 与控制台都是这同一套事件的消费者，行为完全一致。
 
 ---
 
@@ -287,11 +314,29 @@ python tests\feature_test.py           # 配置 / MD 结构 / 停止总结 / 清
 python tests\exit_test.py              # 各种退出方式下总结都不丢
 python tests\lifecycle_test.py         # 开始 / 停止 / 清屏 / 重开 会话生命周期
 python tests\backend_fallback_test.py  # 翻译后端回退、熔断与模型降级
+python tests\degrade_badge_test.py     # 降级提示去重 + UI 徽标端到端
 python tests\ui_test.py                # 字幕窗渲染与事件分发
 python tests\real_capture_test.py      # 真实放音 → 环录 → 识别端到端
 ```
 
 `real_capture_test.py` 会真实占用音频设备，请先关闭正在运行的实例。
+
+`backend_fallback_test.py` 覆盖 21 项断言，其中降级提示相关的一组专门验证「只提示一次」：
+
+| 用例 | 验证点 |
+|---|---|
+| 14a | 主模型持续失败时，同类降级提示全场只出现一次（不逐句刷屏） |
+| 14b | 降级状态通过徽标回调（`route_sink`）暴露，而不是靠反复弹提示 |
+| 14c | 恢复首选路线后提示一次，并清除该路线的去重记录 |
+| 15 | 同一后端的不同模型各自计一次，互不吞掉 |
+| 16 | 全部后端不可用时，停用提示只出现一次，且携带真实失败原因 |
+
+`degrade_badge_test.py` 走完整链路（mock HTTP 后端 + 真实 tkinter 窗口），断言：
+
+- 8 句连续翻译（主模型恒 403）只产生 **1 条**降级提示
+- 降级状态通过 `route` 事件与 `route_state` 暴露
+- UI 徽标实际显示 `⚠ 降级 primary/m-good`
+- 恢复首选路线后徽标自动清空
 
 ---
 
@@ -380,6 +425,41 @@ class ASREngine:
 - 某些平台的 `GET /models` 返回的是**全量模型目录**，不代表你的账号已开通该模型。
   用 `python check_ark.py` 之类脚本做**真实调用探测**才能确定可用性
 - 检查 `summary.system_prompt` / `translate.system_prompt` 是否超出长度限制
+
+</details>
+
+<details>
+<summary><b>降级提示只出现一次，但当前用的哪个模型？</b></summary>
+
+降级状态由字幕窗顶部的**常驻徽标**表达（`⚠ 降级 后端/模型`），不是靠反复弹提示。
+控制台模式对应打印 `[route] 降级：primary/模型名`。徽标在恢复首选路线后自动消失。
+
+若徽标一直不消失，说明首选模型/后端持续不可用——检查对应渠道的额度与可用性。
+实现细节见上文「降级提示策略」。
+
+</details>
+
+<details>
+<summary><b>报 <code>DLL load failed</code> / <code>DLL 初始化例程失败</code>？</b></summary>
+
+这是 **onnxruntime 与 Python ABI 不匹配**，不是文件损坏：
+
+| 报错 | 原因 | 解法 |
+|---|---|---|
+| `onnxruntime_pybind11_state: DLL 初始化例程失败`（WinError 1114） | cp314 的 onnxruntime（1.24.1+）与 Python 3.14 不兼容 | 换 Python 3.13 + `onnxruntime==1.20.1` |
+| `No module named numpy` | 用系统解释器 `--user` 安装，文件被 DLP 改名成 `.IPGSD` | 改用项目内 venv |
+
+核对命令：`python -c "import onnxruntime; print(onnxruntime.__version__)"` 能打印版本号才算装好。
+
+</details>
+
+<details>
+<summary><b>报 <code>module 'soundcard' has no attribute 'default_speaker'</code>？</b></summary>
+
+DLP 把 `site-packages` 里的 `.py` 批量改名成 `.IPGSD`，soundcard 退化成了空壳 namespace 包。
+排查：`import soundcard; print(soundcard.__path__)` 出现 `_NamespacePath(...)` 即已损坏。
+解法：改用项目内 venv，或 `pip install --no-cache-dir --target <干净目录> soundcard==0.4.6 cffi`
+再把该目录加进 `PYTHONPATH`。
 
 </details>
 

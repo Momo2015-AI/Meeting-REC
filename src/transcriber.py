@@ -79,6 +79,14 @@ class MeetingTranscriber:
             ],
         )
         self.events: "queue.Queue[tuple]" = queue.Queue()
+        # 翻译层的降级提示必须在**构造时**就接到事件流。
+        # 旧实现只在 summarize() 里绑定，导致会议进行中的模型/后端降级提示
+        # 全部被丢弃（Translator.events_sink 默认只写 _pending_note，无人读取）。
+        self.translator.events_sink = self._on_translator_note
+        # 路线变化（降级/恢复）→ 常驻徽标状态，不靠反复弹窗表达
+        self.translator.route_sink = self._on_route_change
+        # 翻译被停用 → 徽标转为「仅转写」
+        self.translator.status_sink = self._on_translator_status
         # 采集器延迟创建：只有用户点「开始」后才真正打开系统音频设备。
         # pcm_source 注入（测试用）优先，此时完全不需要真实设备。
         self._pcm_source = pcm_source
@@ -101,6 +109,20 @@ class MeetingTranscriber:
         self._recent_finals: list[str] = []      # 最近几句原文，供翻译上下文
         self.stats = {"finals": 0, "translated": 0, "pcm_bytes": 0, "summarized": False}
         self.translate_status = ""
+
+    # ---------------- 翻译层事件桥接 ----------------
+
+    def _on_translator_note(self, msg: str) -> None:
+        """翻译层降级提示 → 事件流（UI 记一行，控制台打印一次）。"""
+        self.events.put(("note", msg))
+
+    def _on_route_change(self, degraded: bool, backend: str, model: str) -> None:
+        """生效路线变化 → 事件流（UI 更新顶部徽标，不刷屏）。"""
+        self.events.put(("route", degraded, backend, model))
+
+    def _on_translator_status(self, ok: bool, reason: str) -> None:
+        """翻译可用性变化 → 事件流（UI 更新徽标）。"""
+        self.events.put(("trstatus", ok, reason))
 
     # ---------------- 会话生命周期 ----------------
     def _open_session(self) -> None:
@@ -221,8 +243,8 @@ class MeetingTranscriber:
         if not content.strip():
             return False
         self.events.put(("status", "summarizing"))
-        # 把翻译层的回退提示转成事件，让用户看到"降级到哪个模型"
-        self.translator.events_sink = lambda msg: self.events.put(("note", msg))
+        # 翻译层的回退提示已在构造时接到事件流（见 __init__），
+        # 这里无需重复绑定。
         try:
             md = self.translator.summarize(
                 content, self.cfg.summary.system_prompt,

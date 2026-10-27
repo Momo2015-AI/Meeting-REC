@@ -9,6 +9,8 @@
   6. 全部后端都失败 → 返回空串，不抛异常
   7. 总结时主后端失败 → 走备用后端出总结，summary_used_backend 正确
   8. 配置层：alt_backends 能从 TOML 解析出 base_url / 密钥文件
+  9-13. 熔断自愈 / 预检假阳性 / 备用后端不拖累主后端
+  14-16. 降级提示去重：多句只提示一次、恢复后可再提示、停用只提示一次
 """
 from __future__ import annotations
 
@@ -324,7 +326,85 @@ def main() -> int:
     check("场景13b 预检失败后运行期仍能翻译成功",
           out13 == "恢复后的译文", f"译文={out13!r}")
 
-    for srv in (srv, srv2, srv3, srv5, srv6, srv9, srv10, srv11, srv12, srv13):
+    # ---------- 场景 14：降级提示只出现一次（不逐句刷屏）----------
+    # 主模型持续失败 → 降级到同后端下一档。5 句翻译应只产生 1 条降级提示。
+    class _H8(_Handler):
+        def do_POST(self):  # noqa: N802
+            body = self._read_body()
+            if body.get("model") == "m-a":
+                self._send(403, {"error": {"code": "quota", "message": "额度不足"}})
+            else:
+                self._send(200, {"choices": [{"message": {"content": "降级译文"}}]})
+
+    srv14 = HTTPServer(("127.0.0.1", 0), _H8)
+    threading.Thread(target=srv14.serve_forever, daemon=True).start()
+    url14 = f"http://127.0.0.1:{srv14.server_address[1]}/v1"
+    tr14 = Translator(base_url=url14, api_key="k", model="m-a",
+                      translate_models=["m-a", "m-b"])
+    tr14.enabled = True
+    notes14: list[str] = []
+    routes14: list[tuple] = []
+    tr14.events_sink = notes14.append
+    tr14.route_sink = lambda d, b, m: routes14.append((d, b, m))
+    outs14 = [tr14.translate("hello", "en") for _ in range(5)]
+    check("场景14a 降级后仍能正常翻译",
+          all(o == "降级译文" for o in outs14), f"译文={outs14[:2]}")
+    check("场景14b 5 句只提示 1 次（不逐句刷屏）",
+          len(notes14) == 1, f"提示条数={len(notes14)} 内容={notes14}")
+    check("场景14c 降级状态通过徽标回调暴露（不靠反复弹提示）",
+          len(routes14) == 1 and routes14[0][0] is True
+          and tr14.route_state == (True, "primary", "m-b"),
+          f"routes={routes14} state={tr14.route_state}")
+
+    # ---------- 场景 15：恢复首选模型后再降级，可再次提示 ----------
+    class _H9(_Handler):
+        state = {"ok": False}
+
+        def do_POST(self):  # noqa: N802
+            body = self._read_body()
+            if body.get("model") == "m-a" and not self.state["ok"]:
+                self._send(403, {"error": {"code": "quota", "message": "额度不足"}})
+            else:
+                self._send(200, {"choices": [{"message": {"content": "首选译文"}}]})
+
+    srv15 = HTTPServer(("127.0.0.1", 0), _H9)
+    threading.Thread(target=srv15.serve_forever, daemon=True).start()
+    url15 = f"http://127.0.0.1:{srv15.server_address[1]}/v1"
+    tr15 = Translator(base_url=url15, api_key="k", model="m-a",
+                      translate_models=["m-a", "m-b"])
+    tr15.enabled = True
+    notes15: list[str] = []
+    tr15.events_sink = notes15.append
+    tr15.translate("hello", "en")            # 降级
+    _H9.state["ok"] = True                    # 首选模型恢复
+    tr15._breaker["primary"] = 0
+    tr15.translate("hello again", "en")       # 回到首选
+    n_after_recover = len(notes15)
+    tr15.translate("third", "en")
+    check("场景15a 恢复到首选时提示一次",
+          any("恢复" in n for n in notes15), f"notes={notes15}")
+    check("场景15b 恢复后不再重复提示",
+          len(notes15) == n_after_recover, f"提示条数={len(notes15)}")
+
+    # ---------- 场景 16：全部后端失败 → 停用提示只出现一次 ----------
+    tr16 = Translator(base_url="http://127.0.0.1:1/v1", api_key="k", model="m-a",
+                      translate_models=["m-a"])
+    tr16.enabled = True
+    notes16: list[str] = []
+    statuses16: list[tuple] = []
+    tr16.events_sink = notes16.append
+    tr16.status_sink = lambda ok, reason: statuses16.append((ok, reason))
+    for _ in range(6):
+        tr16.translate("hello", "en")
+    check("场景16 全部失败时停用提示只出现一次",
+          len([n for n in notes16 if "停用" in n]) == 1,
+          f"notes={notes16}")
+    check("场景16b 停用状态通过回调暴露",
+          len(statuses16) == 1 and statuses16[0][0] is False,
+          f"statuses={statuses16}")
+
+    for srv in (srv, srv2, srv3, srv5, srv6, srv9, srv10, srv11, srv12, srv13,
+                srv14, srv15):
         srv.shutdown()
 
     n_ok = sum(1 for r in results if r[0] == PASS)

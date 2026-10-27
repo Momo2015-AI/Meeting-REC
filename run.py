@@ -155,6 +155,12 @@ def _drain_console(t: MeetingTranscriber) -> None:
                 print(f"\n[error] {ev[1]}")
             elif ev[0] == "note":
                 print(f"\n[note] {ev[1]}")
+            elif ev[0] == "route":
+                _, degraded, backend, model = ev
+                print(f"\n[route] {'降级' if degraded else '恢复'}：{backend}/{model}")
+            elif ev[0] == "trstatus":
+                _, ok, reason = ev
+                print(f"\n[status] 翻译{'可用' if ok else '已停用'}：{reason}")
     except queue_mod.Empty:
         pass
 

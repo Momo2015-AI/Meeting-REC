@@ -59,6 +59,11 @@ class SubtitleWindow:
             text=("翻译已就绪" if tr_ok else "仅转写"),
             fg=("#3fb950" if tr_ok else "#d29922"), bg=BG, font=("Microsoft YaHei", 9))
         self.tr_lbl.pack(side="left", padx=2)
+        # 降级徽标：仅在翻译路线偏离首选时出现，常驻显示当前后端/模型。
+        # 用状态徽标表达降级，避免靠反复弹提示刷屏。
+        self.degrade_lbl = tk.Label(bar, text="", fg="#d29922", bg=BG,
+                                   font=("Microsoft YaHei", 9))
+        self.degrade_lbl.pack(side="left", padx=2)
         self.btn = tk.Button(bar, text="▶ 开始", command=self._toggle, bg="#238636",
                              fg="#ffffff", relief="flat",
                              font=("Microsoft YaHei", 10), padx=14, cursor="hand2")
@@ -330,6 +335,18 @@ class SubtitleWindow:
                     self._append(ev[1], "err")
                 elif kind == "note":
                     self._append(ev[1], "note")
+                elif kind == "route":
+                    # 生效路线变化 → 刷新常驻降级徽标（不刷屏）
+                    _, degraded, backend, model = ev
+                    if degraded:
+                        self.degrade_lbl.config(text=f"⚠ 降级 {backend}/{model}")
+                    else:
+                        self.degrade_lbl.config(text="")
+                elif kind == "trstatus":
+                    # 翻译被停用 → 徽标转为「仅转写」
+                    _, ok, _reason = ev
+                    if not ok:
+                        self.tr_lbl.config(text="仅转写", fg="#d29922")
                 elif kind == "preflight":
                     # 后台预检完成 → 刷新翻译徽标
                     _, ok, msg = ev
