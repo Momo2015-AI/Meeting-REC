@@ -31,6 +31,12 @@ Meeting-REC 是一个**完全跑在你自己电脑上**的会议记录工具。
 > 密钥只放在你的本机 `secrets/` 目录，该目录已被 `.gitignore` 排除。
 > 语音模型体积较大（约 140 MB），同样不入库，提供一键下载脚本。
 
+> **识别引擎可选**：默认 Vosk（流式逐词）；`[asr]` 改 `engine = "sensevoice"` 切换到
+> SenseVoice-Small（阿里达摩院 FunASR）——识别准确率显著更高、自带标点，
+> 切句由流式 Fsmn-VAD 完成（停顿即断句、超长自动强制断句），连续语速下翻译提早数秒。
+> 模型下载：`python scripts/download_sensevoice.py`（ModelScope 国内直连 ≈ 940 MB）。
+> onnxruntime 建议钉 1.20.1：更新的版本在该机器环境存在 pybind11 扩展加载兼容问题（AV 0xC0000005）。
+
 ---
 
 ## ✨ 功能特性

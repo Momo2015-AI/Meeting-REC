@@ -17,10 +17,17 @@ class AudioCfg:
 
 @dataclass
 class AsrCfg:
+    engine: str = "vosk"          # "vosk"（流式逐词）| "sensevoice"（块级整句，更准更快断句）
     lib_dir: str = "models/lib"
     model_dir: str = "models/vosk-model-small-cn-0.22"
     source_lang: str = "zh"
     partial_interval: float = 0.3
+    # sensevoice 专属参数
+    sv_model_dir: str = "models/sensevoice-small"
+    sv_vad_dir: str = "models/fsmn-vad"
+    sv_threads: int = 4           # ONNX 推理线程数
+    sv_max_block_s: float = 6.0   # 单块最长秒数：超长强制断句（不等停顿）
+    sv_textnorm: str = "woitn"    # 只认 "woitn"（原样，默认）| "withitn"（数字规范化）
 
 
 @dataclass

@@ -16,10 +16,17 @@ reconnect_attempts = 5     # 耳机拔插/默认设备切换导致环录中断�
 reconnect_delay = 3.0      # 每次重连间隔秒数
 
 [asr]
+engine = "vosk"            # 识别引擎："vosk"=流式逐词（默认） | "sensevoice"=块级整句（更准、断句更快）
 lib_dir = "models/lib"     # 识别引擎运行时（libvosk.dll 及依赖）所在目录
 model_dir = "models/vosk-model-small-en-us-0.15"   # 英文会议用英文模型
 source_lang = "en"         # 会议发言语言：en | zh
 partial_interval = 0.3     # 中间结果刷新间隔（秒）
+# SenseVoice 引擎参数（engine="sensevoice" 时生效；先跑 python scripts/download_sensevoice.py）
+sv_model_dir = "models/sensevoice-small"   # SenseVoiceSmall（ModelScope 向下已含 onnx）
+sv_vad_dir = "models/fsmn-vad"             # Fsmn-VAD 流式切句（停顿处断块，避免把词切一半）
+sv_threads = 4             # ONNX 推理线程数（i5-1240P 建议 4）
+sv_max_block_s = 6.0       # 单块最长秒数：超长强制断句送去识别/翻译（不等自然停顿）
+sv_textnorm = "woitn"      # "woitn"=保留原文本（推荐）| "withitn"=数字规范化；只认这两个值
 
 # ---- 中文会议请改用下面两行 ----
 # model_dir = "models/vosk-model-small-cn"

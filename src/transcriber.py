@@ -34,11 +34,25 @@ from .translate import Backend, Translator
 class MeetingTranscriber:
     def __init__(self, cfg, pcm_source: Optional[Callable] = None):
         self.cfg = cfg
-        self.asr = VoskASR(
-            str(cfg.resolve(cfg.asr.lib_dir)),
-            str(cfg.resolve(cfg.asr.model_dir)),
-            cfg.audio.sample_rate,
-        )
+        engine = str(getattr(cfg.asr, "engine", "vosk") or "vosk").lower()
+        if engine == "sensevoice":
+            # 懒导入：engine=vosk 时不背 onnx 依赖
+            from .asr_sensevoice import SenseVoiceStream
+            self.asr = SenseVoiceStream(
+                cfg.resolve(cfg.asr.sv_model_dir),
+                cfg.resolve(cfg.asr.sv_vad_dir),
+                sample_rate=cfg.audio.sample_rate,
+                threads=cfg.asr.sv_threads,
+                lang=cfg.asr.source_lang,
+                max_block_s=cfg.asr.sv_max_block_s,
+                textnorm=cfg.asr.sv_textnorm,
+            )
+        else:
+            self.asr = VoskASR(
+                str(cfg.resolve(cfg.asr.lib_dir)),
+                str(cfg.resolve(cfg.asr.model_dir)),
+                cfg.audio.sample_rate,
+            )
         self.translator = Translator(
             base_url=cfg.translate.base_url,
             api_key=cfg.translate.api_key,
@@ -108,13 +122,15 @@ class MeetingTranscriber:
         self.stats = {"finals": 0, "translated": 0, "pcm_bytes": 0, "summarized": False}
         self._seq_line.clear()
         self._recent_finals.clear()
+        asr_engine = str(getattr(self.cfg.asr, "engine", "vosk"))
         with self._write_lock:
             with open(self.transcript_path, "w", encoding="utf-8") as f:
                 f.write("# 会议双语纪要\n\n")
                 f.write(f"- 开始时间：{datetime.now():%Y-%m-%d %H:%M:%S}\n")
                 f.write(f"- 识别语言：{self.cfg.asr.source_lang} → 翻译目标："
                         f"{self.cfg.translate.target_lang}\n")
-                f.write(f"- 识别模型：{self.cfg.asr.model_dir}\n")
+                f.write(f"- 识别引擎：{asr_engine}（"
+                        f"{self.cfg.asr.model_dir if asr_engine != 'sensevoice' else self.cfg.asr.sv_model_dir}）\n")
                 f.write(f"- 翻译后端：{self.translate_status or '未探测'}\n")
                 if self.cfg.audio.save_audio:
                     f.write("- 原始录音：`meeting.wav`（16 kHz / 16 bit / 单声道）\n")

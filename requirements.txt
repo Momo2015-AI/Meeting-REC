@@ -3,6 +3,12 @@ numpy>=2.0
 cffi>=2.0
 soundcard>=0.4.6
 
+# SenseVoice 引擎（可选，[asr] engine="sensevoice" 时需要）
+funasr-onnx
+onnxruntime==1.20.1        # 钉 1.20.1：≥1.21 的 pybind11 扩展在本机加载崩溃(0xC0000005)；1.18量化器有onnx兼容bug
+sentencepiece==0.2.0       # 同上：0.2.2 加载崩溃
+modelscope                 # 模型下载用（scripts/download_sensevoice.py）
+
 # 说明：
 # 1. 识别引擎不使用 vosk Python 包，而是通过 ctypes 直绑 models/lib/libvosk.dll，
 #    以规避 vosk 包在较新 Python 版本上依赖链不完整导致的导入失败。

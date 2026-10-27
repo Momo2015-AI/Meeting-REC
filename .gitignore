@@ -27,3 +27,5 @@ logs/
 Thumbs.db
 desktop.ini
 .DS_Store
+models/sensevoice-small/
+models/fsmn-vad/

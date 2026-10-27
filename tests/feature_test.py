@@ -85,7 +85,8 @@ def main() -> int:
 
     t._close_session()
     md_text = md_path.read_text(encoding="utf-8")
-    check("MD 含头部元信息", "## 逐句转写" in md_text and "识别模型" in md_text)
+    check("MD 含头部元信息", "## 逐句转写" in md_text
+          and ("识别模型" in md_text or "识别引擎" in md_text))
     check("MD 含全部英文原文", all(en[:25] in md_text for en in en_sentences))
     check("MD 含全部中文译文", all(zh in md_text for zh in zh_translations))
     check("MD 原文译文成对相邻",
