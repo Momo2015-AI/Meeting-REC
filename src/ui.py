@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import queue as queue_mod
+import re
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
@@ -14,6 +15,17 @@ FG_ORIG = "#c9d1d9"
 FG_TRANS = "#f0f6fc"
 FG_PARTIAL = "#8b949e"
 FG_ACCENT = "#58a6ff"
+
+# 提示里的 JSON 错误体（火山方舟等会回一整段）在界面上一律折叠掉
+_JSON_BLOB = re.compile(r"\{[^{}]*\}")
+
+
+def _brief_msg(text: str, limit: int = 90) -> str:
+    """压掉错误 JSON、合并空白并截断，保证提示条最多一行多。"""
+    s = _JSON_BLOB.sub("", text or "")
+    s = " ".join(s.split())
+    s = s.replace("：；", "；").replace("（）", "")
+    return s if len(s) <= limit else s[:limit] + "…"
 
 # 引擎展示信息：键=引擎名，值=(按钮文案, 菜单说明)
 ENGINES: dict[str, tuple[str, str]] = {
@@ -411,7 +423,11 @@ class SubtitleWindow:
                 elif kind == "error":
                     self._append(ev[1], "err")
                 elif kind == "note":
-                    self._append(ev[1], "note")
+                    # 第三位为 True 表示「只进日志、不进正文」（降级/限流细节），
+                    # 正文区保持干净，状态看顶部常驻徽标即可。
+                    silent = len(ev) > 2 and bool(ev[2])
+                    if not silent:
+                        self._append(ev[1], "note")
                 elif kind == "route":
                     # 生效路线变化 → 刷新常驻降级徽标（不刷屏）
                     _, degraded, backend, model = ev
@@ -431,7 +447,7 @@ class SubtitleWindow:
                         self.tr_lbl.config(text="翻译已就绪", fg="#3fb950")
                     else:
                         self.tr_lbl.config(text="仅转写", fg="#d29922")
-                        self._append(f"翻译后端未就绪：{msg}", "note")
+                        self._append(f"翻译后端未就绪：{_brief_msg(msg)}", "note")
         except queue_mod.Empty:
             pass
         self._drain_engine_results()

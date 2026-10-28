@@ -127,8 +127,14 @@ class MeetingTranscriber:
     # ---------------- 翻译层事件桥接 ----------------
 
     def _on_translator_note(self, msg: str) -> None:
-        """翻译层降级提示 → 事件流（UI 记一行，控制台打印一次）。"""
-        self.events.put(("note", msg))
+        """翻译层降级/限流提示 → 只写控制台日志，不进字幕正文。
+
+        正文区只保留「原文 + 译文」；降级状态由顶部常驻徽标
+        （⚠ 降级 backend/model）表达。事件仍投递（第三位 silent=True），
+        供测试与排查消费。
+        """
+        print(f"[translate] {msg}")
+        self.events.put(("note", msg, True))
 
     def _on_route_change(self, degraded: bool, backend: str, model: str) -> None:
         """生效路线变化 → 事件流（UI 更新顶部徽标，不刷屏）。"""

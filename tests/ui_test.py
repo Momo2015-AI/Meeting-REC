@@ -34,6 +34,8 @@ def main() -> int:
     # 译文乱序到达：第 2 句先返回
     t.events.put(("trans", "11:02:44", "现场验收测试。", 2))
     t.events.put(("trans", "11:02:31", "容量为 261 千瓦时。", 1))
+    # 降级/限流提示带 silent=True → 只进日志，不得出现在正文
+    t.events.put(("note", "翻译降级：m-a → m-b（HTTP 429 额度用尽）", True))
 
     for _ in range(20):
         win.root.update()
@@ -64,9 +66,11 @@ def main() -> int:
 
     ok = ("261 kWh" in body and "容量为" in body and "采集中" in status
           and "battery energy storage" in partial and on_top
-          and geo.startswith(str(cfg.ui.width)) and pair_ok)
+          and geo.startswith(str(cfg.ui.width)) and pair_ok
+          and "翻译降级" not in body and "429" not in body)
     win.root.destroy()
     print(f"  配对检查：{'通过' if pair_ok else '未通过'}")
+    print(f"  降级提示静默：{'通过' if '翻译降级' not in body else '未通过（正文仍显示降级细节）'}")
     print(f"  结论：{'通过 —— 字幕窗渲染、事件分发与译文配对正常' if ok else '未通过'}")
     return 0 if ok else 1
 

@@ -345,11 +345,11 @@ class Translator:
                         nxt_be = self._next_backend(backends, be)
                         if nxt_be:
                             self._note(f"summary_rate_limit:{be.name}",
-                                       f"{be.name} 总结触发限流（{e}），"
+                                       f"{be.name} 总结限流（{self._brief(str(e))}），"
                                        f"切换到 {nxt_be.name} 后端")
                         else:
                             self._note(f"summary_rate_limit:{be.name}",
-                                       f"{be.name} 总结触发限流（{e}），"
+                                       f"{be.name} 总结限流（{self._brief(str(e))}），"
                                        f"已暂停 {int(self._rate_limit_cooldown)} 秒后重试")
                         # 限流通常是账号级配额，换模型无意义 → 直接换后端
                         break
@@ -357,13 +357,13 @@ class Translator:
                     if nxt:
                         # 同一模型上的失败只提示一次
                         self._note(f"summary_model_fail:{be.name}:{m}",
-                                   f"总结模型 {m} 失败（{e}），降级到 {nxt}")
+                                   f"总结降级：{m} → {nxt}（{self._brief(str(e))}）")
                         continue
                     # 本后端模型链走完 → 换下一个后端（跨服务商兜底）
                     nxt_be = self._next_backend(backends, be)
                     if nxt_be:
                         self._note(f"summary_backend_fail:{be.name}:{m}",
-                                   f"总结模型 {m} 失败（{e}），切换到 {nxt_be.name} 后端")
+                                   f"总结切到 {nxt_be.name} 后端（{m} 不可用）")
                         break
                     raise
                 if out.strip():
@@ -624,13 +624,13 @@ class Translator:
                     nxt_be = self._next_backend(backends, be)
                     if nxt_be:
                         self._note(f"rate_limit:{be.name}",
-                                   f"{be.name} 后端触发限流（{err}），"
-                                   f"已暂停 {int(self._rate_limit_cooldown)} 秒，"
-                                   f"切换到 {nxt_be.name} 后端")
+                                   f"{be.name} 限流（{self._brief(err)}），"
+                                   f"暂停 {int(self._rate_limit_cooldown)} 秒，"
+                                   f"切到 {nxt_be.name} 后端")
                     else:
                         self._note(f"rate_limit:{be.name}",
-                                   f"{be.name} 后端触发限流（{err}），"
-                                   f"已暂停 {int(self._rate_limit_cooldown)} 秒后重试")
+                                   f"{be.name} 限流（{self._brief(err)}），"
+                                   f"暂停 {int(self._rate_limit_cooldown)} 秒后重试")
                     # 同一后端换模型无意义：限流通常是**账号级**配额
                     # （实测：agnes 三个模型共享同一 1 req/min 配额），
                     # 继续试下一个模型只会多烧请求、多刷提示。
@@ -643,12 +643,12 @@ class Translator:
                 if nxt:
                     # 同一模型上的失败只提示一次，不逐句刷屏
                     self._note(f"model_fail:{be.name}:{m}",
-                               f"翻译模型 {m} 失败（{last_err}），降级到 {nxt}")
+                               f"翻译降级：{m} → {nxt}（{self._brief(last_err)}）")
                     continue
                 nxt_be = self._next_backend(backends, be)
                 if nxt_be:
                     self._note(f"backend_fail:{be.name}:{m}",
-                               f"翻译模型 {m} 失败（{last_err}），切换到 {nxt_be.name} 后端")
+                               f"翻译切到 {nxt_be.name} 后端（{m} 不可用）")
                     break
                 break
 
@@ -673,7 +673,7 @@ class Translator:
             self.disabled_reason = reason
             # 停用只提示一次（后续每句失败不再重复打扰）
             self._note("translate_disabled:all",
-                       f"翻译已停用（连续 {self._fail} 次失败）：{reason}")
+                       f"翻译已停用（连续 {self._fail} 次失败）：{self._brief(reason)}")
             if self.status_sink is not None:
                 self.status_sink(False, reason)
         self.last_error = last_err or self.last_error
@@ -683,6 +683,28 @@ class Translator:
     def _trip_breaker(self, name: str) -> None:
         """记录某后端的一次失败。"""
         self._breaker[name] = self._breaker.get(name, 0) + 1
+
+    @staticmethod
+    def _brief(err: str, limit: int = 60) -> str:
+        """把后端返回的长错误压成一行短原因（仅供日志/徽标，不进正文）。"""
+        e = " ".join((err or "").split())
+        if not e:
+            return "未知错误"
+        code = re.search(r"HTTP\s*(\d{3})", e, re.I)
+        low = e.lower()
+        if any(re.search(p, low) for p in _QUOTA_EXHAUSTED_PATTERNS):
+            reason = "额度用尽"
+        elif any(p in low for p in _RATE_LIMIT_PATTERNS):
+            reason = "限流"
+        elif "modelnotopen" in low or "未开通" in e:
+            reason = "模型未开通"
+        elif "timeout" in low or "timed out" in low or "超时" in e:
+            reason = "超时"
+        elif code:
+            reason = "请求失败"
+        else:
+            return e if len(e) <= limit else e[:limit] + "…"
+        return f"HTTP {code.group(1)} {reason}" if code else reason
 
     @staticmethod
     def _is_rate_limit(err: str) -> bool:
